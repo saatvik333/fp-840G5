@@ -1,0 +1,19 @@
+{
+  "description": "Checksums of separately obtained static vendor files; payloads are not distributed",
+  "hp_package": "sp135736",
+  "data_source_commit": "687c5ea51392582d5bcb1e4fa86eea0832a50c5f",
+  "files": {
+    "138a_00ab/db_write_enable.bin": "943569128f8190481ba32c06276e2f9912324a60f882b4a0102c0224f259a680",
+    "138a_00ab/init.bin": "a2d545c2d69c3657f06d3583e95c17caea25ba62fdab8ea7bb194d2b7c92f4c4",
+    "138a_00ab/init_clean_slate.bin": "af4e9f35aa6c432a6556d743a5e4da8539f3d8c105f6243820e8bab3b32d9704",
+    "138a_00ab/reset.bin": "065c3f798097aeb4db86fd9625266c4a06976fe7d9df12ce2a3ebe98521aabac",
+    "6_07f_hp_cmit_mis_qm.xpfwext": "2b68b33668215cfc2a08c80a1f2c0e66c4c02927895d70a7d5f237e5201d5d2f",
+    "ca_pubkey.bin": "edc24214c954d40cce650b3896c7d4c8c6e73b479ddac830213ca05e731c93ab",
+    "fw_pubkey_x.bin": "bee4814c74c5f1effe5dc26772c7531dbb1a14c70647cb8a14c8233a1cd0a72a",
+    "fw_pubkey_y.bin": "38a4e723c82fee10ae48564294f16a3542294b1f0415ffaaf99b7a1ffa7af3d2",
+    "gwk_sign.bin": "2d5206dd6fbdb62a8d04fa46f13219bfafe2dd8e2e09b21606f6c0fc87c8429c",
+    "partition_sig_0090.bin": "1a7b19fda262fd6b9779c0f94491f3a059489e529e6ad6d15853b501cbe7c822",
+    "partition_sig_standard.bin": "42e7cb9afc2ead80b4c1e2edfc12db4f79a4c652f32327e899a46f849eb2c0da",
+    "tls_password.bin": "9bccbf4b561a4c3dda02a4dfd93c8fc5d12bcc46899b3b9ddd2d71a446941965"
+  }
+}

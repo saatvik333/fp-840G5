@@ -1,0 +1,19 @@
+{
+  "verified_at": "2026-10-13",
+  "libfprint": {
+    "url": "https://gitlab.freedesktop.org/ggiesen/libfprint.git",
+    "commit": "1cf22b89c335b1b63efcccb1113234be9ba2e9d0",
+    "branch": "wip/validity-vcsfw-driver",
+    "proposal": "https://gitlab.freedesktop.org/libfprint/libfprint/-/merge_requests/626"
+  },
+  "libfprint-validity-data": {
+    "url": "https://gitlab.freedesktop.org/ggiesen/libfprint-validity-data.git",
+    "commit": "687c5ea51392582d5bcb1e4fa86eea0832a50c5f"
+  },
+  "python-validity-reference": {
+    "url": "https://github.com/SimpleX-T/python-validity.git",
+    "commit": "128a9ebc9e7e21b12d606b636d839906473dee18",
+    "proposal": "https://github.com/uunicorn/python-validity/pull/256",
+    "usage": "protocol reference only; not installed"
+  }
+}

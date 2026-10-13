@@ -1,0 +1,39 @@
+name: Reader / authentication report
+description: Report compatibility, enrollment, cancellation or authentication behavior.
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Include only model/OS/USB metadata and operation statuses. Never post
+        fingerprints, serials, pairing keys, passwords, USB/TLS dumps or vendor binaries.
+  - type: input
+    id: version
+    attributes:
+      label: Project version or commit
+    validations:
+      required: true
+  - type: input
+    id: system
+    attributes:
+      label: Laptop model, OS/version and kernel
+    validations:
+      required: true
+  - type: input
+    id: usb
+    attributes:
+      label: USB VID:PID and revision
+      placeholder: "138a:00ab, 0164"
+    validations:
+      required: true
+  - type: textarea
+    id: behavior
+    attributes:
+      label: Steps, expected behavior and actual statuses
+      description: Identify enrollment, verify, cancel/reopen, sudo or unlock separately.
+    validations:
+      required: true
+  - type: textarea
+    id: checks
+    attributes:
+      label: Checks performed
+      description: Distinguish offline tests from actual hardware tests. Confirm whether retries were needed.

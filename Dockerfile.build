@@ -1,0 +1,14 @@
+# Builds a driver-only Ubuntu 26.04 package without hardware or vendor downloads.
+FROM ubuntu:26.04@sha256:f144425ff09be612d6d9ad965196e9cdc23dae1f42110a8a11a3e9a8198759f7
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential ca-certificates git meson ninja-build pkgconf dpkg-dev \
+    libglib2.0-dev libgusb-dev libssl-dev libcairo2-dev fprintd libpam-fprintd \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /work
+COPY . .
+RUN python3 -m unittest discover -s tests -v \
+    && python3 tools/native_build.py \
+    && python3 tools/compile_checks.py \
+    && python3 tools/build_ubuntu_package.py \
+    && python3 tools/audit_package.py build/fp840g5-native_0.1.0~alpha1_amd64.deb

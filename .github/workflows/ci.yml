@@ -1,0 +1,34 @@
+name: Source checks
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  offline:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Install development dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential git meson ninja-build pkgconf libglib2.0-dev \
+            libgusb-dev libssl-dev libcairo2-dev python3-venv
+          python3 -m venv /tmp/fp-lint
+          /tmp/fp-lint/bin/pip install ruff==0.17.0
+      - name: Python checks
+        run: |
+          /tmp/fp-lint/bin/ruff check tools/*.py tests
+          /tmp/fp-lint/bin/ruff format --check tools/*.py tests
+          python3 -m unittest discover -s tests -v
+      - name: Build pinned native source and run all six unit suites
+        run: python3 tools/native_build.py
+      - name: Preservation API and policy checks without hardware
+        run: python3 tools/compile_checks.py
+      - name: Audit public tracked files
+        run: python3 tools/audit_publication.py

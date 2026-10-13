@@ -1,0 +1,1801 @@
+diff --git a/libfprint/drivers/validity/validity.c b/libfprint/drivers/validity/validity.c
+index 4f71db6..46e2950 100644
+--- a/libfprint/drivers/validity/validity.c
++++ b/libfprint/drivers/validity/validity.c
+@@ -1,3 +1,4 @@
++/* Modified 2026-10-13 by Saatvik Sharma: recover an idle capture boundary before calibration. */
+ /*
+  * Main driver for Validity/Synaptics VCSFW fingerprint sensors
+  *
+@@ -251,6 +252,12 @@ typedef enum {
+   OPEN_SENSOR_FACTORY_BITS,
+   OPEN_SENSOR_FACTORY_BITS_RECV,
+   OPEN_CAPTURE_SETUP,
++  OPEN_STOP_STALE_CAPTURE,
++  OPEN_STOP_STALE_CAPTURE_RECV,
++  OPEN_CLEAN_STALE_MATCH,
++  OPEN_CLEAN_STALE_MATCH_RECV,
++  OPEN_STALE_LED_OFF,
++  OPEN_STALE_LED_OFF_RECV,
+   OPEN_CALIBRATE_BUILD,
+   OPEN_CALIBRATE_SEND,
+   OPEN_CALIBRATE_SEND_RECV,
+@@ -281,28 +288,20 @@ fw_info_recv_cb (FpiUsbTransfer *transfer,
+       return;
+     }
+ 
+-  /* GET_FW_INFO response: first 2 bytes are status.
+-   * 0x0000 = fwext loaded, 0xb004 = no fwext, others = error */
+-  if (transfer->actual_length >= 2)
++  /* An access/signature/protocol error does not prove firmware is absent.
++   * Fail here before init blobs, pairing, register writes or an upload. */
++  if (!validity_fwext_parse_probe_response (transfer->buffer,
++                                            transfer->actual_length,
++                                            &self->fwext_loaded, &error))
+     {
+-      guint16 status = 0;
+-      validity_unpack (transfer->buffer, transfer->actual_length, "h", &status);
+-      if (status == VCSFW_STATUS_OK)
+-        {
+-          self->fwext_loaded = TRUE;
+-          fp_info ("Firmware extension is loaded");
+-        }
+-      else
+-        {
+-          self->fwext_loaded = FALSE;
+-          fp_info ("Firmware extension not loaded (status=0x%04x)", status);
+-        }
++      fpi_ssm_mark_failed (transfer->ssm, error);
++      return;
+     }
++
++  if (self->fwext_loaded)
++    fp_info ("Firmware extension is loaded");
+   else
+-    {
+-      self->fwext_loaded = FALSE;
+-      fp_warn ("GET_FW_INFO response too short");
+-    }
++    fp_info ("Firmware extension is absent (wire status b0 04)");
+ 
+   fpi_ssm_next_state (transfer->ssm);
+ }
+@@ -1409,6 +1408,43 @@ open_run_state (FpiSsm   *ssm,
+       open_capture_setup (ssm, self);
+       break;
+ 
++    case OPEN_STOP_STALE_CAPTURE:
++      {
++        /* A previous client can leave capture running when it disappears or
++         * cancels. Calibration then fails with 0x0450. Establish an idle
++         * operation boundary over the authenticated session before calibration;
++         * this neither resets the reader nor modifies stored prints. */
++        const guint8 cmd[] = { VCSFW_CMD_CAPTURE_STOP };
++        vcsfw_tls_cmd_send (self, ssm, cmd, sizeof (cmd), NULL);
++      }
++      break;
++
++    case OPEN_STOP_STALE_CAPTURE_RECV:
++    case OPEN_CLEAN_STALE_MATCH_RECV:
++    case OPEN_STALE_LED_OFF_RECV:
++      /* No active capture/match is normal on a clean open. Transport failures
++       * already fail the SSM; cleanup's device status is advisory. */
++      fpi_ssm_next_state (ssm);
++      break;
++
++    case OPEN_CLEAN_STALE_MATCH:
++      {
++        gsize cmd_len;
++        guint8 *cmd = validity_pack_new (&cmd_len, "bw", VCSFW_CMD_MATCH_CLEANUP,
++                                        (guint32) 0);
++        vcsfw_tls_cmd_send (self, ssm, cmd, cmd_len, NULL);
++        g_free (cmd);
++      }
++      break;
++
++    case OPEN_STALE_LED_OFF:
++      {
++        gsize cmd_len;
++        const guint8 *cmd = validity_capture_glow_end_cmd (&cmd_len);
++        vcsfw_tls_cmd_send (self, ssm, cmd, cmd_len, NULL);
++      }
++      break;
++
+     case OPEN_CALIBRATE_BUILD:
+       open_calibrate_build (ssm, self);
+       break;
+diff --git a/libfprint/drivers/validity/validity.h b/libfprint/drivers/validity/validity.h
+index 98d9218..8199b43 100644
+--- a/libfprint/drivers/validity/validity.h
++++ b/libfprint/drivers/validity/validity.h
+@@ -1,3 +1,4 @@
++/* Modified 2026-10-13 by Saatvik Sharma: declare bounded cancellation cleanup state. */
+ /*
+  * Validity/Synaptics VCSFW fingerprint sensor driver
+  *
+@@ -116,6 +117,17 @@ typedef enum {
+   CALIB_NUM_STATES,
+ } ValidityCalibState;
+ 
++/* Cancellation-only cleanup states, shared by enroll and verify/identify.
++ * Each state sends at most one uncancelled TLS command; a failed child still
++ * advances to the next cleanup while FpiSsm retains the original error. */
++typedef enum {
++  VALIDITY_CANCEL_CAPTURE_STOP = 0,
++  VALIDITY_CANCEL_WRITES,
++  VALIDITY_CANCEL_SESSION,
++  VALIDITY_CANCEL_LED_OFF,
++  VALIDITY_CANCEL_NUM_STATES,
++} ValidityCancelState;
++
+ /* Enrollment SSM states — matches python-validity sensor.py Sensor.enroll() */
+ typedef enum {
+   ENROLL_CLEANUP_STALE = 0,    /* Close any stale enrollment session */
+@@ -184,6 +196,10 @@ typedef enum {
+   ENROLL_LED_OFF,                /* PY: glow_end_scan() — LAST step per PY */
+   ENROLL_LED_OFF_RECV,
+   ENROLL_DONE,
++  ENROLL_CANCEL_CAPTURE_STOP,
++  ENROLL_CANCEL_WRITES,
++  ENROLL_CANCEL_SESSION,
++  ENROLL_CANCEL_LED_OFF,
+   ENROLL_NUM_STATES,
+ } ValidityEnrollState;
+ 
+@@ -212,6 +228,10 @@ typedef enum {
+   VERIFY_GET_MATCH_USER,       /* read the matched user record (cmd 0x4a) */
+   VERIFY_GET_MATCH_USER_RECV,
+   VERIFY_DONE,
++  VERIFY_CANCEL_CAPTURE_STOP,
++  VERIFY_CANCEL_WRITES,
++  VERIFY_CANCEL_SESSION,
++  VERIFY_CANCEL_LED_OFF,
+   VERIFY_NUM_STATES,
+ } ValidityVerifyState;
+ 
+@@ -313,6 +333,7 @@ struct _FpiDeviceValidity
+   gboolean enroll_frame_rejected;   /* sensor rejected (0x0526) or flagged the last frame -- retry stage */
+   guint    enroll_reject_retries;   /* cumulative frame retries -- bounds broken-firmware loops */
+   gint     enroll_reported;         /* highest completed_stages reported this action */
++  gboolean enroll_write_pending;    /* issued a write whose call_cleanups has not succeeded */
+ 
+   /* Verify: retry state for empty/phantom captures (no finger down) */
+   guint    verify_capture_retries;
+@@ -412,6 +433,26 @@ typedef enum {
+ ValidityErrClass validity_classify_error (const GError *error,
+                                           gboolean      device_alive);
+ 
++/* Cancellation helpers shared by enroll and verify/identify. The send seam
++ * permits hardware-free tests of the actual FpiSsm cleanup lifecycle. */
++typedef void (*ValidityCancelSend) (FpiSsm      *ssm,
++                                    const guint8 *cmd,
++                                    gsize         cmd_len);
++
++gboolean validity_action_check_cancel (FpiSsm      *ssm,
++                                       GCancellable *cancellable);
++GError *validity_cancel_error (GError      *error,
++                               GCancellable *cancellable);
++void validity_cancel_cleanup_run_state (FpiSsm           *ssm,
++                                        gint              start_cleanup,
++                                        gboolean          enrolling,
++                                        gboolean          pending_writes,
++                                        GCancellable     *cancellable,
++                                        ValidityCancelSend send);
++void validity_cancel_cleanup_send (FpiSsm      *ssm,
++                                    const guint8 *cmd,
++                                    gsize         cmd_len);
++
+ /* Liveness probe: TRUE if the sensor still answers on the bus (a reset that
+  * only dropped the session) vs FALSE if it has left (re-enumeration). Does one
+  * cheap control request; only call off the hot path (i.e. on an error). */
+diff --git a/libfprint/drivers/validity/validity_data.c b/libfprint/drivers/validity/validity_data.c
+index f90fb26..a1e6e2d 100644
+--- a/libfprint/drivers/validity/validity_data.c
++++ b/libfprint/drivers/validity/validity_data.c
+@@ -1,3 +1,4 @@
++/* Modified 2026-10-13 by Saatvik Sharma: support the configured private data prefix. */
+ /*
+  * Runtime data file loader for Validity/Synaptics VCSFW fingerprint sensors
+  *
+@@ -20,6 +21,7 @@
+ 
+ #define FP_COMPONENT "validity"
+ 
++#include "config.h"
+ #include "validity_data.h"
+ #include "fpi-log.h"
+ #include "fp-device.h"
+@@ -39,6 +41,7 @@
+ 
+ /* Search paths for data files */
+ const gchar *validity_data_search_paths[] = {
++  LIBFPRINT_VALIDITY_DATADIR,
+   "/usr/share/libfprint/validity",
+   "/usr/local/share/libfprint/validity",
+   NULL,
+diff --git a/libfprint/drivers/validity/validity_enroll.c b/libfprint/drivers/validity/validity_enroll.c
+index 782bb20..51d6b21 100644
+--- a/libfprint/drivers/validity/validity_enroll.c
++++ b/libfprint/drivers/validity/validity_enroll.c
+@@ -1,3 +1,4 @@
++/* Modified 2026-10-13 by Saatvik Sharma: finish sensor cleanup after enrollment cancellation. */
+ /*
+  * Enrollment state machine for Validity/Synaptics VCSFW sensors
+  *
+@@ -128,13 +129,6 @@ interrupt_cb (FpiUsbTransfer *transfer,
+ 
+   if (error)
+     {
+-      if (g_error_matches (error, G_IO_ERROR, G_IO_ERROR_CANCELLED))
+-        {
+-          fpi_ssm_mark_failed (ssm,
+-                               fpi_device_error_new (FP_DEVICE_ERROR_REMOVED));
+-          g_error_free (error);
+-          return;
+-        }
+       /* Scan-complete timeout — finger was likely stale (no fresh placement).
+        * Stop capture, signal user to lift, then retry. */
+       if (g_error_matches (error, G_USB_DEVICE_ERROR, G_USB_DEVICE_ERROR_TIMED_OUT) &&
+@@ -289,18 +283,9 @@ update_interrupt_cb (FpiUsbTransfer *transfer,
+ 
+   if (error)
+     {
+-      if (g_error_matches (error, G_IO_ERROR, G_IO_ERROR_CANCELLED))
+-        {
+-          g_clear_error (&error);
+-          fpi_ssm_mark_failed (ssm,
+-                               fpi_device_error_new (FP_DEVICE_ERROR_REMOVED));
+-        }
+-      else
+-        {
+-          /* fpi_ssm_mark_failed takes ownership of the error (and here
+-           * synchronously frees the SSM); do not free it again. */
+-          fpi_ssm_mark_failed (ssm, g_steal_pointer (&error));
+-        }
++      /* Retain either Gio or GUsb cancellation. The parent's cleanup states
++       * stop capture and close enrollment before reporting the error. */
++      fpi_ssm_mark_failed (ssm, error);
+       return;
+     }
+ 
+@@ -421,6 +406,7 @@ enroll_cleanup_stale (FpiSsm            *ssm,
+   self->scan_incomplete_count = 0;
+   self->enroll_frame_rejected = FALSE;
+   self->enroll_reject_retries = 0;
++  self->enroll_write_pending = FALSE;
+   g_clear_pointer (&self->enroll_template, g_free);
+   self->enroll_template_len = 0;
+   vcsfw_tls_cmd_send (self, ssm, cmd, cmd_len, NULL);
+@@ -942,6 +928,20 @@ enroll_run_state (FpiSsm   *ssm,
+ {
+   FpiDeviceValidity *self = FPI_DEVICE_VALIDITY (dev);
+ 
++  if (fpi_ssm_get_cur_state (ssm) >= ENROLL_CANCEL_CAPTURE_STOP)
++    {
++      validity_cancel_cleanup_run_state (ssm, ENROLL_CANCEL_CAPTURE_STOP,
++                                          TRUE, self->enroll_write_pending,
++                                          fpi_device_get_cancellable (dev),
++                                          validity_cancel_cleanup_send);
++      return;
++    }
++
++  /* A command already on the wire must finish, but a pending cancellation
++   * must stop the next capture/update/record write at the state boundary. */
++  if (validity_action_check_cancel (ssm, fpi_device_get_cancellable (dev)))
++    return;
++
+   switch (fpi_ssm_get_cur_state (ssm))
+     {
+     case ENROLL_CLEANUP_STALE:
+@@ -1155,6 +1155,7 @@ enroll_run_state (FpiSsm   *ssm,
+         gsize cmd_len;
+         guint8 *cmd = validity_db_build_cmd_enrollment_update (
+           self->enroll_template, self->enroll_template_len, &cmd_len);
++        self->enroll_write_pending = TRUE;
+         vcsfw_tls_cmd_send (self, ssm, cmd, cmd_len, NULL);
+         g_free (cmd);
+       }
+@@ -1174,6 +1175,9 @@ enroll_run_state (FpiSsm   *ssm,
+       break;
+ 
+     case ENROLL_CLEANUPS_RECV:
++      if (self->cmd_response_status == VCSFW_STATUS_OK ||
++          self->cmd_response_status == 0x0491)
++        self->enroll_write_pending = FALSE;
+       if (self->cmd_response_status != VCSFW_STATUS_OK &&
+           self->cmd_response_status != 0x0491)
+         fp_warn ("call_cleanups (1st) failed: status=0x%04x",
+@@ -1211,6 +1215,7 @@ enroll_run_state (FpiSsm   *ssm,
+         gsize cmd_len;
+         guint8 *cmd = validity_db_build_cmd_enrollment_update (
+           self->enroll_template, self->enroll_template_len, &cmd_len);
++        self->enroll_write_pending = TRUE;
+         vcsfw_tls_cmd_send (self, ssm, cmd, cmd_len, NULL);
+         g_free (cmd);
+       }
+@@ -1230,6 +1235,9 @@ enroll_run_state (FpiSsm   *ssm,
+       break;
+ 
+     case ENROLL_CLEANUPS_READ_RECV:
++      if (self->cmd_response_status == VCSFW_STATUS_OK ||
++          self->cmd_response_status == 0x0491)
++        self->enroll_write_pending = FALSE;
+       if (self->cmd_response_status != VCSFW_STATUS_OK &&
+           self->cmd_response_status != 0x0491)
+         fp_warn ("call_cleanups (2nd) failed: status=0x%04x",
+@@ -1304,6 +1312,7 @@ enroll_run_state (FpiSsm   *ssm,
+         gsize cmd_len;
+         guint8 *cmd = validity_db_build_cmd_new_record (
+           1, 4, 3, (const guint8 *) name, name_len, &cmd_len);
++        self->enroll_write_pending = TRUE;
+         vcsfw_tls_cmd_send (self, ssm, cmd, cmd_len, NULL);
+         g_free (cmd);
+       }
+@@ -1332,6 +1341,9 @@ enroll_run_state (FpiSsm   *ssm,
+       break;
+ 
+     case ENROLL_INIT_STORAGE_CLEAN_RECV:
++      if (self->cmd_response_status == VCSFW_STATUS_OK ||
++          self->cmd_response_status == 0x0491)
++        self->enroll_write_pending = FALSE;
+       /* Now retry get_user_storage to get the dbid */
+       fpi_ssm_jump_to_state (ssm, ENROLL_GET_STORAGE);
+       break;
+@@ -1357,6 +1369,7 @@ enroll_run_state (FpiSsm   *ssm,
+       break;
+ 
+     case ENROLL_CREATE_USER:
++      self->enroll_write_pending = TRUE;
+       enroll_create_user (ssm, self);
+       break;
+ 
+@@ -1374,6 +1387,9 @@ enroll_run_state (FpiSsm   *ssm,
+       break;
+ 
+     case ENROLL_CREATE_USER_CLEANUPS_RECV:
++      if (self->cmd_response_status == VCSFW_STATUS_OK ||
++          self->cmd_response_status == 0x0491)
++        self->enroll_write_pending = FALSE;
+       fpi_ssm_next_state (ssm);
+       break;
+ 
+@@ -1398,6 +1414,7 @@ enroll_run_state (FpiSsm   *ssm,
+       break;
+ 
+     case ENROLL_CREATE_FINGER:
++      self->enroll_write_pending = TRUE;
+       enroll_create_finger (ssm, self);
+       break;
+ 
+@@ -1415,6 +1432,9 @@ enroll_run_state (FpiSsm   *ssm,
+       break;
+ 
+     case ENROLL_FINAL_CLEANUPS_RECV:
++      if (self->cmd_response_status == VCSFW_STATUS_OK ||
++          self->cmd_response_status == 0x0491)
++        self->enroll_write_pending = FALSE;
+       fpi_ssm_next_state (ssm);
+       break;
+ 
+@@ -1469,6 +1489,8 @@ enroll_ssm_done (FpiSsm   *ssm,
+ {
+   FpiDeviceValidity *self = FPI_DEVICE_VALIDITY (dev);
+ 
++  error = validity_cancel_error (error, fpi_device_get_cancellable (dev));
++
+   if (error)
+     {
+       g_clear_pointer (&self->enroll_template, g_free);
+@@ -1476,6 +1498,13 @@ enroll_ssm_done (FpiSsm   *ssm,
+       g_clear_pointer (&self->bulk_data, g_free);
+       self->bulk_data_len = 0;
+ 
++      if (g_error_matches (error, G_IO_ERROR, G_IO_ERROR_CANCELLED))
++        {
++          /* Cancellation has finished its cleanup and must not reset/retry. */
++          fpi_device_enroll_complete (dev, NULL, error);
++          return;
++        }
++
+       /* Recoverable mid-operation reset? Reconnect and restart enroll instead
+        * of failing the action (bounded; a true removal falls through). The
+        * on-chip enroll session is lost on reset, so this restarts from stage 0
+@@ -1588,6 +1617,7 @@ validity_enroll (FpDevice *device)
+       self->enroll_reported = 0;         /* and the reported progress */
+     }
+ 
+-  ssm = fpi_ssm_new (device, enroll_run_state, ENROLL_NUM_STATES);
++  ssm = fpi_ssm_new_full (device, enroll_run_state, ENROLL_NUM_STATES,
++                         ENROLL_CANCEL_CAPTURE_STOP, "VALIDITY_ENROLL");
+   fpi_ssm_start (ssm, enroll_ssm_done);
+ }
+diff --git a/libfprint/drivers/validity/validity_fwext.c b/libfprint/drivers/validity/validity_fwext.c
+index 6f1d7cf..691f834 100644
+--- a/libfprint/drivers/validity/validity_fwext.c
++++ b/libfprint/drivers/validity/validity_fwext.c
+@@ -1,3 +1,4 @@
++/* Modified 2026-10-13 by Saatvik Sharma: validate firmware status and configured-prefix lookup. */
+ /*
+  * Validity/Synaptics VCSFW firmware extension upload
+  *
+@@ -20,6 +21,7 @@
+ 
+ #define FP_COMPONENT "validity"
+ 
++#include "config.h"
+ #include "drivers_api.h"
+ #include "fpi-byte-utils.h"
+ #include "validity.h"
+@@ -55,6 +57,7 @@
+ /* ---- Firmware file search paths ---- */
+ 
+ static const gchar *firmware_search_paths[] = {
++  LIBFPRINT_VALIDITY_DATADIR,
+   "/usr/share/libfprint/validity",
+   "/var/lib/python-validity",
+   "/var/run/python-validity",
+@@ -68,6 +71,40 @@ static const gchar *firmware_search_paths[] = {
+  * Firmware info parsing
+  * ================================================================ */
+ 
++gboolean
++validity_fwext_parse_probe_response (const guint8 *response,
++                                      gsize         response_len,
++                                      gboolean     *loaded,
++                                      GError      **error)
++{
++  guint16 status = 0;
++
++  g_return_val_if_fail (loaded != NULL, FALSE);
++  *loaded = FALSE;
++
++  if (!response || response_len < 2)
++    {
++      g_set_error (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
++                   "GET_FW_INFO response has no complete status (%" G_GSIZE_FORMAT " bytes)",
++                   response_len);
++      return FALSE;
++    }
++
++  validity_unpack (response, response_len, "h", &status);
++  if (status == VCSFW_STATUS_OK)
++    {
++      *loaded = TRUE;
++      return TRUE;
++    }
++  if (status == VCSFW_STATUS_NO_FW)
++    return TRUE;
++
++  g_set_error (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
++               "GET_FW_INFO returned error status 0x%04x; refusing firmware upload",
++               status);
++  return FALSE;
++}
++
+ gboolean
+ validity_fwext_parse_fw_info (const guint8   *data,
+                               gsize           data_len,
+@@ -76,7 +113,7 @@ validity_fwext_parse_fw_info (const guint8   *data,
+ {
+   memset (info, 0, sizeof (*info));
+ 
+-  /* Status 0xB004 (bytes: 0xb0 0x04) means no firmware loaded.
++  /* Wire bytes 0xb0 0x04 mean no firmware loaded.
+    * python-validity checks: rsp[0]==0xb0 and rsp[1]==4
+    * Our vcsfw_cmd_send reads status as uint16 LE from the first 2 bytes,
+    * so wire bytes {0xb0, 0x04} -> status = 0x04B0 in LE. */
+diff --git a/libfprint/drivers/validity/validity_fwext.h b/libfprint/drivers/validity/validity_fwext.h
+index e8583a3..22e9ab3 100644
+--- a/libfprint/drivers/validity/validity_fwext.h
++++ b/libfprint/drivers/validity/validity_fwext.h
+@@ -1,3 +1,4 @@
++/* Modified 2026-10-13 by Saatvik Sharma: declare firmware probe response validation. */
+ /*
+  * Validity/Synaptics VCSFW firmware extension upload
+  *
+@@ -84,6 +85,15 @@ typedef enum {
+ 
+ /* ---- API ---- */
+ 
++/* Classify the two wire-status bytes of a raw GET_FW_INFO response.
++ * Only OK means loaded and NO_FW means absent; errors
++ * or a missing/partial status return FALSE with @loaded cleared. This does
++ * not parse the module metadata (validity_fwext_parse_fw_info does that). */
++gboolean validity_fwext_parse_probe_response (const guint8 *response,
++                                               gsize         response_len,
++                                               gboolean     *loaded,
++                                               GError      **error);
++
+ gboolean validity_fwext_parse_fw_info (const guint8   *data,
+                                        gsize           data_len,
+                                        guint16         status,
+diff --git a/libfprint/drivers/validity/validity_pair.c b/libfprint/drivers/validity/validity_pair.c
+index 7cd6be7..e8e5755 100644
+--- a/libfprint/drivers/validity/validity_pair.c
++++ b/libfprint/drivers/validity/validity_pair.c
+@@ -1,3 +1,4 @@
++/* Modified 2026-10-13 by Saatvik Sharma: gate factory-empty provisioning on the captured HP G5 identity. */
+ /*
+  * Device pairing for Validity/Synaptics VCSFW fingerprint sensors
+  *
+@@ -28,6 +29,7 @@
+ #include "validity.h"
+ #include "validity_pack.h"
+ #include "validity_data.h"
++#include "validity_fwext.h"
+ #include "validity_pair.h"
+ #include "validity_tls.h"
+ #include "vcsfw_protocol.h"
+@@ -235,6 +237,77 @@ validity_pair_decide (guint16               num_partitions,
+     }
+ }
+ 
++/* The only captured factory-empty 138a:00ab bootstrap is PR #256's
++ * ROM 6.7/build 164/product 48 and 0x0190:0x0070 identity (0xd51,
++ * 57K0 FM-154-120). In particular, the same USB ID's 0x969 variant is
++ * not admitted. The ROM response's complete captured payload is 36 bytes;
++ * identify is exactly 8 bytes. No serial number is part of the gate.
++ * Reference: python-validity 128a9eb, init_flash.py / clean_slate_probe.py. */
++ValidityPairSsmState
++validity_pair_hp_preflight_next (ValidityPairSsmState state,
++                                 guint16              status,
++                                 const guint8        *data,
++                                 gsize                data_len)
++{
++  if ((data_len > 0 && data == NULL) ||
++      (status != VCSFW_STATUS_OK &&
++       !(state == PAIR_AB_BOOTSTRAP_CLEANUPS_RECV && status == 0x0491)))
++    return PAIR_NUM_STATES;
++
++  /* All non-preflight states intentionally reach the refusal below. */
++  switch ((gint) state)
++    {
++    case PAIR_AB_BOOTSTRAP_ROM_RECV:
++      {
++        ValidityVersionInfo version = { 0 };
++
++        if (data_len != 36 || !vcsfw_parse_version (data, data_len, &version) ||
++            version.build_time != 1415491824 || version.build_num != 164 ||
++            version.version_major != 6 || version.version_minor != 7 ||
++            version.product != 48)
++          return PAIR_NUM_STATES;
++
++        return PAIR_AB_BOOTSTRAP_IDENTIFY_SEND;
++      }
++
++    case PAIR_AB_BOOTSTRAP_IDENTIFY_RECV:
++    case PAIR_AB_BOOTSTRAP_REIDENTIFY_RECV:
++      {
++        ValiditySensorIdent identity = { 0 };
++
++        if (data_len != 8 || FP_READ_UINT32_LE (data) != 0 ||
++            !validity_sensor_parse_identify (data, data_len, &identity) ||
++            identity.hw_major != 0x0190 || identity.hw_version != 0x0070)
++          return PAIR_NUM_STATES;
++
++        return state == PAIR_AB_BOOTSTRAP_IDENTIFY_RECV ?
++               PAIR_AB_BOOTSTRAP_WRITE_REG_SEND : PAIR_AB_BOOTSTRAP_CLEANUPS_SEND;
++      }
++
++    case PAIR_AB_BOOTSTRAP_WRITE_REG_RECV:
++      return data_len == 0 ? PAIR_AB_BOOTSTRAP_READ_REG_SEND : PAIR_NUM_STATES;
++
++    case PAIR_AB_BOOTSTRAP_READ_REG_RECV:
++      {
++        guint32 value = 0;
++
++        if (data_len != 4 ||
++            !validity_fwext_parse_read_hw_reg32 (data, data_len, &value) ||
++            (value != 2 && value != 3))
++          return PAIR_NUM_STATES;
++
++        return PAIR_AB_BOOTSTRAP_REIDENTIFY_SEND;
++      }
++
++    case PAIR_AB_BOOTSTRAP_CLEANUPS_RECV:
++      /* 0x0491 means nothing to commit, as in python-validity call_cleanups. */
++      return data_len == 0 ? PAIR_SEND_RESET_BLOB : PAIR_NUM_STATES;
++
++    default:
++      return PAIR_NUM_STATES;
++    }
++}
++
+ /* ================================================================
+  * Partition serialization
+  *
+@@ -837,9 +910,45 @@ pair_apply_decision (FpiSsm            *ssm,
+       return;
+     }
+ 
++  if (ps->dev_desc->vid == 0x138a && ps->dev_desc->pid == 0x00ab)
++    {
++      /* Set before the first read: sub-SSM USB errors propagate without
++       * reaching a RECV state, so validation alone cannot mark them fatal.
++       * pair_ssm_done must not continue on any preflight/reset failure. */
++      ps->refused = TRUE;
++      fpi_ssm_jump_to_state (ssm, PAIR_AB_BOOTSTRAP_ROM_SEND);
++      return;
++    }
++
+   fpi_ssm_jump_to_state (ssm, PAIR_SEND_RESET_BLOB);
+ }
+ 
++static void
++pair_hp_preflight_recv (FpiSsm            *ssm,
++                        FpiDeviceValidity *self)
++{
++  ValidityPairSsmState state = fpi_ssm_get_cur_state (ssm);
++  ValidityPairSsmState next = validity_pair_hp_preflight_next (
++    state, self->cmd_response_status, self->cmd_response_data,
++    self->cmd_response_len);
++
++  if (next == PAIR_NUM_STATES)
++    {
++      pair_refuse (ssm, self,
++                   fpi_device_error_new_msg (FP_DEVICE_ERROR_NOT_SUPPORTED,
++                                             "Refusing factory-empty 138a:00ab "
++                                             "bootstrap: ROM/sensor identity or "
++                                             "preflight response does not match "
++                                             "the captured 0xd51 sequence "
++                                             "(state %d, status 0x%04x, %" G_GSIZE_FORMAT " bytes)",
++                                             state, self->cmd_response_status,
++                                             self->cmd_response_len));
++      return;
++    }
++
++  fpi_ssm_jump_to_state (ssm, next);
++}
++
+ static void
+ pair_check_needed (FpiSsm            *ssm,
+                    FpiDeviceValidity *self)
+@@ -1422,6 +1531,57 @@ validity_pair_run_state (FpiSsm   *ssm,
+       pair_verify_tls_recv (ssm, self);
+       break;
+ 
++    case PAIR_AB_BOOTSTRAP_ROM_SEND:
++      {
++        guint8 cmd[] = { VCSFW_CMD_GET_VERSION };
++        vcsfw_cmd_send (self, ssm, cmd, sizeof (cmd), NULL);
++        break;
++      }
++
++    case PAIR_AB_BOOTSTRAP_IDENTIFY_SEND:
++    case PAIR_AB_BOOTSTRAP_REIDENTIFY_SEND:
++      {
++        guint8 cmd[] = { VCSFW_CMD_IDENTIFY_SENSOR };
++        vcsfw_cmd_send (self, ssm, cmd, sizeof (cmd), NULL);
++        break;
++      }
++
++    case PAIR_AB_BOOTSTRAP_WRITE_REG_SEND:
++      {
++        guint8 cmd[10];
++        gsize cmd_len;
++
++        validity_fwext_build_write_hw_reg32 (0x8000205c, 7, cmd, &cmd_len);
++        vcsfw_cmd_send (self, ssm, cmd, cmd_len, NULL);
++        break;
++      }
++
++    case PAIR_AB_BOOTSTRAP_READ_REG_SEND:
++      {
++        guint8 cmd[6];
++        gsize cmd_len;
++
++        validity_fwext_build_read_hw_reg32 (0x80002080, cmd, &cmd_len);
++        vcsfw_cmd_send (self, ssm, cmd, cmd_len, NULL);
++        break;
++      }
++
++    case PAIR_AB_BOOTSTRAP_CLEANUPS_SEND:
++      {
++        guint8 cmd[] = { VCSFW_CMD_CLEANUPS };
++        vcsfw_cmd_send (self, ssm, cmd, sizeof (cmd), NULL);
++        break;
++      }
++
++    case PAIR_AB_BOOTSTRAP_ROM_RECV:
++    case PAIR_AB_BOOTSTRAP_IDENTIFY_RECV:
++    case PAIR_AB_BOOTSTRAP_WRITE_REG_RECV:
++    case PAIR_AB_BOOTSTRAP_READ_REG_RECV:
++    case PAIR_AB_BOOTSTRAP_REIDENTIFY_RECV:
++    case PAIR_AB_BOOTSTRAP_CLEANUPS_RECV:
++      pair_hp_preflight_recv (ssm, self);
++      break;
++
+     case PAIR_SEND_RESET_BLOB:
+       pair_send_reset_blob (ssm, self);
+       break;
+@@ -1435,6 +1595,12 @@ validity_pair_run_state (FpiSsm   *ssm,
+                                fpi_device_error_new (FP_DEVICE_ERROR_PROTO));
+           break;
+         }
++      /* The guarded preflight and reset both succeeded. Resume the existing
++       * pairing lifecycle, including its expected USB failure at reboot. */
++      if (self->pair_state.dev_desc &&
++          self->pair_state.dev_desc->vid == 0x138a &&
++          self->pair_state.dev_desc->pid == 0x00ab)
++        self->pair_state.refused = FALSE;
+       fpi_ssm_next_state (ssm);
+       break;
+ 
+diff --git a/libfprint/drivers/validity/validity_pair.h b/libfprint/drivers/validity/validity_pair.h
+index 71988d8..b9a8d1b 100644
+--- a/libfprint/drivers/validity/validity_pair.h
++++ b/libfprint/drivers/validity/validity_pair.h
+@@ -1,3 +1,4 @@
++/* Modified 2026-10-13 by Saatvik Sharma: declare the HP G5 provisioning identity gate. */
+ /*
+  * Device pairing for Validity/Synaptics VCSFW fingerprint sensors
+  *
+@@ -74,8 +75,10 @@ typedef struct
+   ValidityPairDecision decision;
+ 
+   /* Set when the SSM refused to pair, or stopped pairing on a 0x0404 from
+-   * partition_flash. pair_ssm_done then fails the open with the SSM's error
+-   * instead of continuing. */
++   * partition_flash. Also set throughout the guarded 138a:00ab preflight,
++   * so an asynchronous USB error cannot bypass its refusal. Cleared only
++   * after the reset payload succeeds. pair_ssm_done then fails the open
++   * with the SSM's error instead of continuing. */
+   gboolean refused;
+ 
+   /* ECDH client key pair (generated during pairing) */
+@@ -289,6 +292,10 @@ void validity_pair_state_free (ValidityPairState *state);
+  *
+  * Phase 1 (pre-TLS, raw USB):
+  *   - GET_FLASH_INFO  → check if pairing needed
++ *   - For factory-empty 138a:00ab only, read and validate the captured ROM
++ *     and silicon identity, write/read the preflight register, revalidate
++ *     the identity, and commit cleanup before any reset/partition command.
++ *     Unknown identities and incomplete/error responses refuse provisioning.
+  *   - SEND_RESET_BLOB → reset device state
+  *   - GENERATE_KEYS   → ECDH key generation
+  *   - PARTITION_FLASH  → format flash + write certs (CMD 0x4f)
+@@ -324,6 +331,18 @@ typedef enum {
+   PAIR_CHECK_NEEDED,
+   PAIR_VERIFY_TLS_SEND,
+   PAIR_VERIFY_TLS_RECV,
++  PAIR_AB_BOOTSTRAP_ROM_SEND,
++  PAIR_AB_BOOTSTRAP_ROM_RECV,
++  PAIR_AB_BOOTSTRAP_IDENTIFY_SEND,
++  PAIR_AB_BOOTSTRAP_IDENTIFY_RECV,
++  PAIR_AB_BOOTSTRAP_WRITE_REG_SEND,
++  PAIR_AB_BOOTSTRAP_WRITE_REG_RECV,
++  PAIR_AB_BOOTSTRAP_READ_REG_SEND,
++  PAIR_AB_BOOTSTRAP_READ_REG_RECV,
++  PAIR_AB_BOOTSTRAP_REIDENTIFY_SEND,
++  PAIR_AB_BOOTSTRAP_REIDENTIFY_RECV,
++  PAIR_AB_BOOTSTRAP_CLEANUPS_SEND,
++  PAIR_AB_BOOTSTRAP_CLEANUPS_RECV,
+   PAIR_SEND_RESET_BLOB,
+   PAIR_SEND_RESET_BLOB_RECV,
+   PAIR_GENERATE_KEYS,
+@@ -354,6 +373,17 @@ typedef enum {
+   PAIR_NUM_STATES,
+ } ValidityPairSsmState;
+ 
++/* Validate one response in the experimental 138a:00ab clean-slate preflight
++ * and return the next send state. @data is the payload after the wire status.
++ * PAIR_NUM_STATES means refusal, including an unknown or send state.
++ * The ROM and identity checks match the pinned python-validity PR #256
++ * 128a9eb clean-slate evidence; only 0xd51 / FM-154-120 is admitted.
++ * This helper performs no hardware access. */
++ValidityPairSsmState validity_pair_hp_preflight_next (ValidityPairSsmState state,
++                                                     guint16              status,
++                                                     const guint8        *data,
++                                                     gsize                data_len);
++
+ /* CMD 0x1a (cleanups/commit) */
+ #define VCSFW_CMD_CLEANUPS 0x1a
+ 
+diff --git a/libfprint/drivers/validity/validity_verify.c b/libfprint/drivers/validity/validity_verify.c
+index 157556a..90fde86 100644
+--- a/libfprint/drivers/validity/validity_verify.c
++++ b/libfprint/drivers/validity/validity_verify.c
+@@ -1,3 +1,4 @@
++/* Modified 2026-10-13 by Saatvik Sharma: finish sensor cleanup after verification cancellation. */
+ /*
+  * Verify and Identify state machines for Validity/Synaptics VCSFW sensors
+  *
+@@ -50,6 +51,122 @@
+ #include "validity.h"
+ #include "vcsfw_protocol.h"
+ 
++/* ================================================================
++ * Action cancellation cleanup (shared with enrollment)
++ * ================================================================ */
++
++gboolean
++validity_action_check_cancel (FpiSsm       *ssm,
++                              GCancellable *cancellable)
++{
++  if (!g_cancellable_is_cancelled (cancellable))
++    return FALSE;
++
++  fpi_ssm_mark_failed (ssm,
++                       g_error_new_literal (G_IO_ERROR, G_IO_ERROR_CANCELLED,
++                                            "Fingerprint operation cancelled"));
++  return TRUE;
++}
++
++/* libfprint callers expect Gio cancellation, including when GUsb supplied
++ * the interrupt error. Other errors retain their original domain and code. */
++GError *
++validity_cancel_error (GError       *error,
++                       GCancellable *cancellable)
++{
++  gboolean cancelled = validity_classify_error (error, FALSE) == VALIDITY_ERR_CANCELLED ||
++                       (cancellable && g_cancellable_is_cancelled (cancellable));
++
++  if (cancelled && !g_error_matches (error, G_IO_ERROR, G_IO_ERROR_CANCELLED))
++    {
++      GError *cancel_error = g_error_new_literal (G_IO_ERROR, G_IO_ERROR_CANCELLED,
++                                                  error ? error->message : "Fingerprint operation cancelled");
++      g_clear_error (&error);
++      return cancel_error;
++    }
++  return error;
++}
++
++void
++validity_cancel_cleanup_send (FpiSsm       *ssm,
++                              const guint8 *cmd,
++                              gsize         cmd_len)
++{
++  FpiDeviceValidity *self = FPI_DEVICE_VALIDITY (fpi_ssm_get_device (ssm));
++
++  /* The action's cancellable has already fired. The TLS command transport
++   * deliberately submits its bounded USB transfers with a NULL cancellable,
++   * so stopping the operation on the chip can finish before we report cancel. */
++  vcsfw_tls_cmd_send (self, ssm, cmd, cmd_len, NULL);
++}
++
++void
++validity_cancel_cleanup_run_state (FpiSsm           *ssm,
++                                   gint              start_cleanup,
++                                   gboolean          enrolling,
++                                   gboolean          pending_writes,
++                                   GCancellable     *cancellable,
++                                   ValidityCancelSend send)
++{
++  gint state = fpi_ssm_get_cur_state (ssm) - start_cleanup;
++  g_autofree guint8 *owned_cmd = NULL;
++  const guint8 *cmd;
++  gsize cmd_len;
++
++  g_return_if_fail (state >= 0 && state < VALIDITY_CANCEL_NUM_STATES);
++  g_return_if_fail (send != NULL);
++
++  /* Normal completion already took its normal cleanup path; non-cancellation
++   * errors keep their existing recovery policy. Only cancellation enters this
++   * bounded best-effort stop sequence. FpiSsm preserves its first error if a
++   * cleanup child fails and still runs the remaining cleanup states. */
++  if (validity_classify_error (fpi_ssm_get_error (ssm), FALSE) != VALIDITY_ERR_CANCELLED &&
++      !(cancellable && g_cancellable_is_cancelled (cancellable)))
++    {
++      fpi_ssm_next_state (ssm);
++      return;
++    }
++
++  switch ((ValidityCancelState) state)
++    {
++    case VALIDITY_CANCEL_CAPTURE_STOP:
++      owned_cmd = validity_pack_new (&cmd_len, "b", VCSFW_CMD_CAPTURE_STOP);
++      cmd = owned_cmd;
++      break;
++
++    case VALIDITY_CANCEL_WRITES:
++      if (!enrolling || !pending_writes)
++        {
++          fpi_ssm_next_state (ssm);
++          return;
++        }
++      /* Finish only writes already issued by this enrollment, just as the
++       * regular enrollment-update finally path does. Never enable writes,
++       * create/delete records, erase flash, reset, or provision on cancel. */
++      owned_cmd = validity_db_build_cmd_call_cleanups (&cmd_len);
++      cmd = owned_cmd;
++      break;
++
++    case VALIDITY_CANCEL_SESSION:
++      if (enrolling)
++        owned_cmd = validity_db_build_cmd_create_enrollment (FALSE, &cmd_len);
++      else
++        owned_cmd = validity_pack_new (&cmd_len, "bw", VCSFW_CMD_MATCH_CLEANUP,
++                                        (guint32) 0);
++      cmd = owned_cmd;
++      break;
++
++    case VALIDITY_CANCEL_LED_OFF:
++      cmd = validity_capture_glow_end_cmd (&cmd_len);
++      break;
++
++    case VALIDITY_CANCEL_NUM_STATES:
++      g_assert_not_reached ();
++    }
++
++  send (ssm, cmd, cmd_len);
++}
++
+ /* ================================================================
+  * Interrupt helpers (shared with enrollment)
+  * ================================================================ */
+@@ -66,13 +183,8 @@ verify_interrupt_cb (FpiUsbTransfer *transfer,
+ 
+   if (error)
+     {
+-      if (g_error_matches (error, G_IO_ERROR, G_IO_ERROR_CANCELLED))
+-        {
+-          fpi_ssm_mark_failed (ssm,
+-                               fpi_device_error_new (FP_DEVICE_ERROR_REMOVED));
+-          g_error_free (error);
+-          return;
+-        }
++      /* Preserve cancellation in either Gio or GUsb form so the parent SSM
++       * stops capture and matching before completing the action. */
+       fpi_ssm_mark_failed (ssm, error);
+       return;
+     }
+@@ -641,6 +753,19 @@ verify_run_state (FpiSsm   *ssm,
+ {
+   FpiDeviceValidity *self = FPI_DEVICE_VALIDITY (dev);
+ 
++  if (fpi_ssm_get_cur_state (ssm) >= VERIFY_CANCEL_CAPTURE_STOP)
++    {
++      validity_cancel_cleanup_run_state (ssm, VERIFY_CANCEL_CAPTURE_STOP,
++                                          FALSE, FALSE, fpi_device_get_cancellable (dev),
++                                          validity_cancel_cleanup_send);
++      return;
++    }
++
++  /* TLS commands are uncancelled; notice Stop as soon as their response (or
++   * a delayed state transition) completes, before starting another command. */
++  if (validity_action_check_cancel (ssm, fpi_device_get_cancellable (dev)))
++    return;
++
+   switch (fpi_ssm_get_cur_state (ssm))
+     {
+     case VERIFY_LED_ON:
+@@ -863,10 +988,25 @@ verify_ssm_done (FpiSsm   *ssm,
+ {
+   FpiDeviceValidity *self = FPI_DEVICE_VALIDITY (dev);
+ 
++  /* A cancelled action may instead have received a timeout/removal from an
++   * already submitted uncancelled command. It has run cancellation cleanup
++   * too, and must report cancellation without entering reset/recovery. */
++  error = validity_cancel_error (error, fpi_device_get_cancellable (dev));
++
+   if (error)
+     {
+       validity_verify_clear_match_state (self);
+ 
++      if (g_error_matches (error, G_IO_ERROR, G_IO_ERROR_CANCELLED))
++        {
++          /* Cleanup has finished; cancellation must never invoke reconnect. */
++          if (self->identify_mode)
++            fpi_device_identify_complete (dev, error);
++          else
++            fpi_device_verify_complete (dev, error);
++          return;
++        }
++
+       /* Recoverable mid-operation reset? Reconnect and retry instead of
+        * failing the action (bounded; a true removal falls through). */
+       if (validity_recover_or_fail (self, error, verify_reconnect_done,
+@@ -1051,7 +1191,8 @@ validity_verify (FpDevice *device)
+   else
+     self->reconnect_attempts = 0;        /* fresh action -- reset the budget */
+ 
+-  ssm = fpi_ssm_new (device, verify_run_state, VERIFY_NUM_STATES);
++  ssm = fpi_ssm_new_full (device, verify_run_state, VERIFY_NUM_STATES,
++                         VERIFY_CANCEL_CAPTURE_STOP, "VALIDITY_VERIFY");
+   fpi_ssm_start (ssm, verify_ssm_done);
+ }
+ 
+@@ -1075,7 +1216,8 @@ validity_identify (FpDevice *device)
+   else
+     self->reconnect_attempts = 0;
+ 
+-  ssm = fpi_ssm_new (device, verify_run_state, VERIFY_NUM_STATES);
++  ssm = fpi_ssm_new_full (device, verify_run_state, VERIFY_NUM_STATES,
++                         VERIFY_CANCEL_CAPTURE_STOP, "VALIDITY_IDENTIFY");
+   fpi_ssm_start (ssm, verify_ssm_done);
+ }
+ 
+diff --git a/libfprint/drivers/validity/vcsfw_protocol.h b/libfprint/drivers/validity/vcsfw_protocol.h
+index b961fcc..01adf14 100644
+--- a/libfprint/drivers/validity/vcsfw_protocol.h
++++ b/libfprint/drivers/validity/vcsfw_protocol.h
+@@ -1,3 +1,4 @@
++/* Modified 2026-10-13 by Saatvik Sharma: correct the little-endian absent-firmware status. */
+ /*
+  * VCSFW protocol definitions for Validity/Synaptics fingerprint sensors
+  *
+@@ -58,7 +59,7 @@
+ 
+ /* ---- VCSFW Response Status Codes ---- */
+ #define VCSFW_STATUS_OK 0x0000
+-#define VCSFW_STATUS_NO_FW 0xB004
++#define VCSFW_STATUS_NO_FW 0x04B0  /* wire bytes b0 04, decoded little-endian */
+ 
+ /* ---- Callback types ---- */
+ 
+diff --git a/meson.build b/meson.build
+index 41aac84..16a96b0 100644
+--- a/meson.build
++++ b/meson.build
+@@ -1,3 +1,4 @@
++# Modified 2026-10-13 by Saatvik Sharma: configure private-prefix Validity data lookup.
+ project('libfprint', [ 'c', 'cpp' ],
+     version: '1.94.100',
+     license: 'LGPLv2.1+',
+@@ -20,6 +21,7 @@ prefix = get_option('prefix')
+ libdir = prefix / get_option('libdir')
+ libexecdir = prefix / get_option('libexecdir')
+ datadir = prefix / get_option('datadir')
++libfprint_conf.set_quoted('LIBFPRINT_VALIDITY_DATADIR', datadir / 'libfprint' / 'validity')
+ 
+ cc = meson.get_compiler('c')
+ cpp = meson.get_compiler('cpp')
+diff --git a/tests/test-validity.c b/tests/test-validity.c
+index 3bb5d26..f46006e 100644
+--- a/tests/test-validity.c
++++ b/tests/test-validity.c
+@@ -1,3 +1,4 @@
++/* Modified 2026-10-13 by Saatvik Sharma: test HP preflight, firmware status, data lookup and cancellation. */
+ /*
+  * Unit tests for the validity (VCSFW) fingerprint driver
+  *
+@@ -1023,20 +1024,115 @@ test_fw_info_parse_present (void)
+ /* ================================================================
+  * T3.2: test_fw_info_parse_absent
+  *
+- * Verify that status VCSFW_STATUS_NO_FW sets loaded=FALSE.
++ * Decode the literal vendor wire response, independently of the macro.
+  * ================================================================ */
+ static void
+ test_fw_info_parse_absent (void)
+ {
++  const guint8 wire[] = { 0xb0, 0x04 };
++  guint16 decoded = FP_READ_UINT16_LE (wire);
+   ValidityFwInfo info;
+ 
++  g_assert_cmpuint (decoded, ==, 0x04b0);
++  g_assert_cmpuint (VCSFW_STATUS_NO_FW, ==, decoded);
+   gboolean ok = validity_fwext_parse_fw_info (NULL, 0,
+-                                              VCSFW_STATUS_NO_FW, &info);
++                                              decoded, &info);
+ 
+   g_assert_true (ok);
+   g_assert_false (info.loaded);
+ }
+ 
++static void
++test_fw_info_probe_present_and_absent (void)
++{
++  const guint8 present[] = { 0x00, 0x00 };
++  const guint8 absent[] = { 0xb0, 0x04 };
++  g_autoptr(GError) error = NULL;
++  gboolean loaded = FALSE;
++
++  g_assert_true (validity_fwext_parse_probe_response (present, sizeof (present),
++                                                      &loaded, &error));
++  g_assert_no_error (error);
++  g_assert_true (loaded);
++
++  g_assert_true (validity_fwext_parse_probe_response (absent, sizeof (absent),
++                                                      &loaded, &error));
++  g_assert_no_error (error);
++  g_assert_false (loaded);
++}
++
++static void
++test_fw_info_probe_swapped_status (void)
++{
++  const guint8 swapped[] = { 0x04, 0xb0 };
++  guint16 decoded = FP_READ_UINT16_LE (swapped);
++  ValidityFwInfo info;
++  g_autoptr(GError) error = NULL;
++  gboolean loaded = TRUE;
++
++  g_assert_cmpuint (decoded, ==, 0xb004);
++  g_assert_false (validity_fwext_parse_probe_response (swapped, sizeof (swapped),
++                                                       &loaded, &error));
++  g_assert_error (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO);
++  g_assert_false (loaded);
++
++  g_test_expect_message ("libfprint-validity", G_LOG_LEVEL_WARNING,
++                         "*unexpected status*");
++  g_assert_false (validity_fwext_parse_fw_info (NULL, 0, decoded, &info));
++  g_test_assert_expected_messages ();
++  g_assert_false (info.loaded);
++}
++
++static void
++test_fw_info_probe_errors (void)
++{
++  /* Permission error 0404, signature error wire 044f, numeric 0x044f,
++   * and unknown status: none may turn into an absent-firmware upload. */
++  const guint8 responses[][2] = {
++    { 0x04, 0x04 }, { 0x04, 0x4f }, { 0x4f, 0x04 }, { 0x99, 0x99 },
++  };
++
++  for (guint i = 0; i < G_N_ELEMENTS (responses); i++)
++    {
++      g_autoptr(GError) error = NULL;
++      gboolean loaded = TRUE;
++
++      g_assert_false (validity_fwext_parse_probe_response (responses[i], 2,
++                                                           &loaded, &error));
++      g_assert_error (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO);
++      g_assert_false (loaded);
++    }
++}
++
++static void
++test_fw_info_probe_truncated_status (void)
++{
++  const guint8 responses[][2] = { { 0x00, 0x00 }, { 0xb0, 0x04 } };
++
++  for (guint i = 0; i < G_N_ELEMENTS (responses); i++)
++    for (gsize len = 0; len < 2; len++)
++      {
++        g_autoptr(GError) error = NULL;
++        gboolean loaded = TRUE;
++
++        g_assert_false (validity_fwext_parse_probe_response (responses[i], len,
++                                                             &loaded, &error));
++        g_assert_error (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO);
++        g_assert_false (loaded);
++      }
++
++  for (gsize len = 0; len <= 2; len++)
++    {
++      g_autoptr(GError) error = NULL;
++      gboolean loaded = TRUE;
++
++      g_assert_false (validity_fwext_parse_probe_response (NULL, len,
++                                                           &loaded, &error));
++      g_assert_error (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO);
++      g_assert_false (loaded);
++    }
++}
++
+ /* ================================================================
+  * T3.2b: test_fw_info_parse_unknown_status
+  *
+@@ -3450,6 +3546,348 @@ test_classify_error (void)
+   g_error_free (e);
+ }
+ 
++/* ================================================================
++ * Cancellation: exercise the production cleanup runner with real parent and
++ * child FpiSsms. The fake transport leaves every command pending until the
++ * test supplies a response/error, so early completion is observable.
++ * ================================================================ */
++
++typedef struct
++{
++  gboolean     enrolling;
++  gboolean     pending_writes;
++  gboolean     boundary_cancel;
++  gboolean     cancel_before_error;
++  gint         action_state;
++  gint         start_cleanup;
++  gint         num_states;
++  GError      *initial_error;
++  GCancellable *cancellable;
++  GPtrArray   *commands;
++  FpiSsm      *pending_child;
++  gboolean     completed;
++  GError      *error;
++} CancelTest;
++
++static void
++cancel_test_child_wait (FpiSsm   *ssm,
++                        FpDevice *dev)
++{
++  /* No device I/O: completion is supplied by cancel_test_finish(). */
++  g_assert_true (FP_IS_DEVICE (dev));
++  g_assert_cmpint (fpi_ssm_get_cur_state (ssm), ==, 0);
++}
++
++static void
++cancel_test_send (FpiSsm       *ssm,
++                  const guint8 *cmd,
++                  gsize         cmd_len)
++{
++  CancelTest *test = fpi_ssm_get_data (ssm);
++
++  g_assert_false (test->completed);
++  g_assert_null (test->pending_child);
++  g_assert_true (validity_classify_error (fpi_ssm_get_error (ssm), FALSE) == VALIDITY_ERR_CANCELLED ||
++                 g_cancellable_is_cancelled (test->cancellable));
++  g_ptr_array_add (test->commands, g_bytes_new (cmd, cmd_len));
++
++  test->pending_child = fpi_ssm_new (fpi_ssm_get_device (ssm),
++                                    cancel_test_child_wait, 1);
++  fpi_ssm_start_subsm (ssm, test->pending_child);
++}
++
++static void
++cancel_test_run_state (FpiSsm   *ssm,
++                       FpDevice *dev)
++{
++  CancelTest *test = fpi_ssm_get_data (ssm);
++  gint state = fpi_ssm_get_cur_state (ssm);
++
++  g_assert_true (FP_IS_DEVICE (dev));
++  if (state >= test->start_cleanup)
++    {
++      validity_cancel_cleanup_run_state (ssm, test->start_cleanup,
++                                          test->enrolling, test->pending_writes,
++                                          test->cancellable,
++                                          cancel_test_send);
++      return;
++    }
++
++  if (state == 0 && test->action_state != 0)
++    {
++      fpi_ssm_jump_to_state (ssm, test->action_state);
++      return;
++    }
++  g_assert_cmpint (state, ==, test->action_state);
++
++  if (test->boundary_cancel)
++    {
++      g_assert_false (validity_action_check_cancel (ssm, test->cancellable));
++      g_cancellable_cancel (test->cancellable);
++      g_assert_true (validity_action_check_cancel (ssm, test->cancellable));
++    }
++  else if (test->initial_error)
++    {
++      if (test->cancel_before_error)
++        g_cancellable_cancel (test->cancellable);
++      fpi_ssm_mark_failed (ssm, g_steal_pointer (&test->initial_error));
++    }
++  else
++    fpi_ssm_mark_completed (ssm);
++}
++
++static void
++cancel_test_done (FpiSsm   *ssm,
++                  FpDevice *dev,
++                  GError   *error)
++{
++  CancelTest *test = fpi_ssm_get_data (ssm);
++
++  g_assert_null (test->pending_child);
++  g_assert_false (test->completed);
++  test->completed = TRUE;
++  test->error = validity_cancel_error (error, test->cancellable);
++}
++
++static void
++cancel_test_start (CancelTest *test,
++                   FpDevice   *dev)
++{
++  FpiSsm *ssm;
++
++  test->start_cleanup = test->enrolling ? ENROLL_CANCEL_CAPTURE_STOP : VERIFY_CANCEL_CAPTURE_STOP;
++  test->num_states = test->enrolling ? ENROLL_NUM_STATES : VERIFY_NUM_STATES;
++  test->commands = g_ptr_array_new_with_free_func ((GDestroyNotify) g_bytes_unref);
++  test->cancellable = g_cancellable_new ();
++  ssm = fpi_ssm_new_full (dev, cancel_test_run_state, test->num_states,
++                         test->start_cleanup, "VALIDITY_CANCEL_TEST");
++  fpi_ssm_set_data (ssm, test, NULL);
++  fpi_ssm_start (ssm, cancel_test_done);
++}
++
++static void
++cancel_test_finish (CancelTest *test,
++                    gint        fail_command)
++{
++  const guint8 stop[] = { 0x04 };
++  const guint8 cleanups[] = { 0x1a };
++  const guint8 match_end[] = { 0x62, 0, 0, 0, 0 };
++  const guint8 enroll_end[] = { 0x69, 0, 0, 0, 0 };
++  const guint8 led_off_prefix[] = { 0x39, 0xf4, 0x01, 0, 0, 0xf4, 0x01, 0, 0 };
++  gboolean commit = test->enrolling && test->pending_writes;
++  guint count = commit ? 4 : 3;
++
++  for (guint i = 0; i < count; i++)
++    {
++      const guint8 *cmd;
++      gsize len;
++      FpiSsm *child;
++
++      /* Stop/Release must still be waiting, including during LED-off. */
++      g_assert_false (test->completed);
++      g_assert_nonnull (test->pending_child);
++      g_assert_cmpuint (test->commands->len, ==, i + 1);
++      cmd = g_bytes_get_data (g_ptr_array_index (test->commands, i), &len);
++      if (i == 0)
++        g_assert_cmpmem (cmd, len, stop, sizeof (stop));
++      else if (commit && i == 1)
++        g_assert_cmpmem (cmd, len, cleanups, sizeof (cleanups));
++      else if (i == count - 2)
++        {
++          if (test->enrolling)
++            g_assert_cmpmem (cmd, len, enroll_end, sizeof (enroll_end));
++          else
++            g_assert_cmpmem (cmd, len, match_end, sizeof (match_end));
++        }
++      else
++        {
++          g_assert_cmpuint (len, >, sizeof (led_off_prefix));
++          g_assert_cmpmem (cmd, sizeof (led_off_prefix),
++                           led_off_prefix, sizeof (led_off_prefix));
++        }
++
++      child = g_steal_pointer (&test->pending_child);
++      if ((gint) i == fail_command)
++        fpi_ssm_mark_failed (child,
++                             g_error_new_literal (G_USB_DEVICE_ERROR,
++                                                  G_USB_DEVICE_ERROR_NO_DEVICE,
++                                                  "secondary cleanup failure"));
++      else
++        fpi_ssm_mark_completed (child);
++    }
++
++  g_assert_true (test->completed);
++  g_assert_null (test->pending_child);
++  g_assert_cmpuint (test->commands->len, ==, count);
++  g_assert_error (test->error, G_IO_ERROR, G_IO_ERROR_CANCELLED);
++  /* Neither a failed capture-stop nor later cleanup may replace this error
++   * with REMOVED/NO_DEVICE or start a reconnect/reset. */
++  if (!test->boundary_cancel && !test->cancel_before_error)
++    g_assert_cmpstr (test->error->message, ==, "original action cancellation");
++}
++
++static void
++cancel_test_clear (CancelTest *test)
++{
++  g_assert_null (test->pending_child);
++  g_clear_error (&test->initial_error);
++  g_clear_error (&test->error);
++  g_clear_object (&test->cancellable);
++  g_clear_pointer (&test->commands, g_ptr_array_unref);
++}
++
++static void
++test_cancel_verify_wait (void)
++{
++  g_autoptr(FpDevice) dev = g_object_new (FPI_TYPE_DEVICE_FAKE, NULL);
++  CancelTest test = { .action_state = VERIFY_WAIT_FINGER };
++
++  test.initial_error = g_error_new_literal (G_IO_ERROR, G_IO_ERROR_CANCELLED,
++                                            "original action cancellation");
++  cancel_test_start (&test, dev);
++  cancel_test_finish (&test, -1);
++  cancel_test_clear (&test);
++}
++
++static void
++test_cancel_identify_match_wait (void)
++{
++  g_autoptr(FpDevice) dev = g_object_new (FPI_TYPE_DEVICE_FAKE, NULL);
++  CancelTest test = { .action_state = VERIFY_WAIT_MATCH_INT };
++
++  test.initial_error = g_error_new_literal (G_USB_DEVICE_ERROR,
++                                            G_USB_DEVICE_ERROR_CANCELLED,
++                                            "original action cancellation");
++  cancel_test_start (&test, dev);
++  cancel_test_finish (&test, -1);
++  cancel_test_clear (&test);
++}
++
++static void
++test_cancel_enroll_capture_wait (void)
++{
++  g_autoptr(FpDevice) dev = g_object_new (FPI_TYPE_DEVICE_FAKE, NULL);
++  const gint states[] = { ENROLL_WAIT_FINGER, ENROLL_WAIT_SCAN_COMPLETE,
++                          ENROLL_WAIT_UPDATE_START_INT, ENROLL_WAIT_UPDATE_INT };
++
++  for (guint i = 0; i < G_N_ELEMENTS (states); i++)
++    {
++      CancelTest test = { .enrolling = TRUE, .action_state = states[i] };
++
++      test.initial_error = g_error_new_literal (G_IO_ERROR, G_IO_ERROR_CANCELLED,
++                                                "original action cancellation");
++      cancel_test_start (&test, dev);
++      cancel_test_finish (&test, -1);
++      cancel_test_clear (&test);
++    }
++}
++
++static void
++test_cancel_enroll_pending_write (void)
++{
++  g_autoptr(FpDevice) dev = g_object_new (FPI_TYPE_DEVICE_FAKE, NULL);
++  CancelTest test = { .enrolling = TRUE, .pending_writes = TRUE,
++                      .action_state = ENROLL_APPEND_IMAGE_RECV };
++
++  test.initial_error = g_error_new_literal (G_USB_DEVICE_ERROR,
++                                            G_USB_DEVICE_ERROR_CANCELLED,
++                                            "original action cancellation");
++  cancel_test_start (&test, dev);
++  cancel_test_finish (&test, -1);
++  cancel_test_clear (&test);
++}
++
++static void
++test_cancel_between_states (void)
++{
++  g_autoptr(FpDevice) dev = g_object_new (FPI_TYPE_DEVICE_FAKE, NULL);
++  const struct { gboolean enrolling; gint state; } cases[] = {
++    { FALSE, VERIFY_BUILD_CAPTURE },
++    { FALSE, VERIFY_MATCH_START },
++    { TRUE, ENROLL_DB_WRITE_ENABLE },
++    { TRUE, ENROLL_CREATE_USER },
++    { TRUE, ENROLL_CREATE_FINGER },
++  };
++
++  for (guint i = 0; i < G_N_ELEMENTS (cases); i++)
++    {
++      CancelTest test = { .enrolling = cases[i].enrolling,
++                          .action_state = cases[i].state,
++                          .boundary_cancel = TRUE };
++
++      cancel_test_start (&test, dev);
++      cancel_test_finish (&test, -1);
++      cancel_test_clear (&test);
++    }
++}
++
++static void
++test_cancel_cleanup_failures (void)
++{
++  g_autoptr(FpDevice) dev = g_object_new (FPI_TYPE_DEVICE_FAKE, NULL);
++
++  for (guint enrolling = 0; enrolling < 2; enrolling++)
++    for (gint fail = 0; fail < (enrolling ? 4 : 3); fail++)
++      {
++        CancelTest test = { .enrolling = enrolling, .pending_writes = enrolling,
++                            .action_state = enrolling ? ENROLL_WAIT_UPDATE_INT : VERIFY_WAIT_FINGER };
++
++        test.initial_error = g_error_new_literal (G_USB_DEVICE_ERROR,
++                                                  G_USB_DEVICE_ERROR_CANCELLED,
++                                                  "original action cancellation");
++        cancel_test_start (&test, dev);
++        cancel_test_finish (&test, fail);
++        cancel_test_clear (&test);
++      }
++}
++
++static void
++test_cancel_during_command_error (void)
++{
++  g_autoptr(FpDevice) dev = g_object_new (FPI_TYPE_DEVICE_FAKE, NULL);
++  const gint errors[] = { G_USB_DEVICE_ERROR_TIMED_OUT, G_USB_DEVICE_ERROR_NO_DEVICE };
++
++  for (guint enrolling = 0; enrolling < 2; enrolling++)
++    for (guint i = 0; i < G_N_ELEMENTS (errors); i++)
++      {
++        CancelTest test = { .enrolling = enrolling, .cancel_before_error = TRUE,
++                            .action_state = enrolling ? ENROLL_CAPTURE_RECV : VERIFY_CAPTURE_RECV };
++
++        /* Stop fired during an uncancelled command, which then failed with
++         * its transport error. Cleanup must still run, without reconnect. */
++        test.initial_error = g_error_new_literal (G_USB_DEVICE_ERROR, errors[i],
++                                                  "uncancelled transfer failed after Stop");
++        cancel_test_start (&test, dev);
++        cancel_test_finish (&test, -1);
++        cancel_test_clear (&test);
++      }
++}
++
++static void
++test_cancel_cleanup_skips_other_results (void)
++{
++  g_autoptr(FpDevice) dev = g_object_new (FPI_TYPE_DEVICE_FAKE, NULL);
++
++  for (guint enrolling = 0; enrolling < 2; enrolling++)
++    for (guint failed = 0; failed < 2; failed++)
++      {
++        CancelTest test = { .enrolling = enrolling, .pending_writes = TRUE,
++                            .action_state = enrolling ? ENROLL_DONE : VERIFY_DONE };
++
++        if (failed)
++          test.initial_error = fpi_device_error_new (FP_DEVICE_ERROR_PROTO);
++        cancel_test_start (&test, dev);
++        g_assert_true (test.completed);
++        g_assert_null (test.pending_child);
++        g_assert_cmpuint (test.commands->len, ==, 0);
++        if (failed)
++          g_assert_error (test.error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO);
++        else
++          g_assert_no_error (test.error);
++        cancel_test_clear (&test);
++      }
++}
++
+ /* ================================================================
+  * R1f: match_result_clear frees hash
+  *
+@@ -4752,6 +5190,232 @@ test_pair_decide (void)
+                    ==, VALIDITY_PAIR_REFUSE_UNREADABLE);
+ }
+ 
++/* Public PR #256's zero-partition G5 ROM response has 36 payload bytes.
++ * Unique serial bytes are synthetic: the bootstrap gate is the captured ROM
++ * family plus 0x0190/0x0070 silicon, not one particular machine's serial. */
++static void
++make_hp_preflight_rom (guint8 rom[36])
++{
++  memset (rom, 0, 36);
++  FP_WRITE_UINT32_LE (rom, 1415491824);
++  FP_WRITE_UINT32_LE (rom + 4, 164);
++  rom[8] = 6;
++  rom[9] = 7;
++  rom[11] = 48;
++}
++
++static void
++make_hp_preflight_identity (guint8 identity[8])
++{
++  FP_WRITE_UINT32_LE (identity, 0);
++  FP_WRITE_UINT16_LE (identity + 4, 0x0070);
++  FP_WRITE_UINT16_LE (identity + 6, 0x0190);
++}
++
++/* Responses authorize each captured command in order. In particular, reset
++ * is not authorized by a ROM/sensor identity or a register read alone. */
++static void
++test_pair_hp_preflight_sequence (void)
++{
++  guint8 rom[36], identity[8], reg[4];
++
++  make_hp_preflight_rom (rom);
++  make_hp_preflight_identity (identity);
++  FP_WRITE_UINT32_LE (reg, 2);
++
++  g_assert_cmpint (validity_pair_hp_preflight_next (PAIR_AB_BOOTSTRAP_ROM_RECV,
++                                                   0, rom, sizeof (rom)),
++                   ==, PAIR_AB_BOOTSTRAP_IDENTIFY_SEND);
++  g_assert_cmpint (validity_pair_hp_preflight_next (PAIR_AB_BOOTSTRAP_IDENTIFY_RECV,
++                                                   0, identity, sizeof (identity)),
++                   ==, PAIR_AB_BOOTSTRAP_WRITE_REG_SEND);
++  g_assert_cmpint (validity_pair_hp_preflight_next (PAIR_AB_BOOTSTRAP_WRITE_REG_RECV,
++                                                   0, NULL, 0),
++                   ==, PAIR_AB_BOOTSTRAP_READ_REG_SEND);
++  g_assert_cmpint (validity_pair_hp_preflight_next (PAIR_AB_BOOTSTRAP_READ_REG_RECV,
++                                                   0, reg, sizeof (reg)),
++                   ==, PAIR_AB_BOOTSTRAP_REIDENTIFY_SEND);
++  g_assert_cmpint (validity_pair_hp_preflight_next (PAIR_AB_BOOTSTRAP_REIDENTIFY_RECV,
++                                                   0, identity, sizeof (identity)),
++                   ==, PAIR_AB_BOOTSTRAP_CLEANUPS_SEND);
++  g_assert_cmpint (validity_pair_hp_preflight_next (PAIR_AB_BOOTSTRAP_CLEANUPS_RECV,
++                                                   0, NULL, 0),
++                   ==, PAIR_SEND_RESET_BLOB);
++  g_assert_cmpint (validity_pair_hp_preflight_next (PAIR_AB_BOOTSTRAP_CLEANUPS_RECV,
++                                                   0x0491, NULL, 0),
++                   ==, PAIR_SEND_RESET_BLOB);
++}
++
++static void
++test_pair_hp_preflight_rom_refusal (void)
++{
++  guint8 rom[37];
++  /* Every byte of each gated field matters, including high bytes. */
++  const guint mismatch_offsets[] = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 11 };
++
++  make_hp_preflight_rom (rom);
++  for (guint i = 0; i < G_N_ELEMENTS (mismatch_offsets); i++)
++    {
++      guint offset = mismatch_offsets[i];
++      rom[offset] ^= 1;
++      g_assert_cmpint (validity_pair_hp_preflight_next (PAIR_AB_BOOTSTRAP_ROM_RECV,
++                                                       0, rom, 36),
++                       ==, PAIR_NUM_STATES);
++      rom[offset] ^= 1;
++    }
++
++  for (gsize len = 0; len < 36; len++)
++    g_assert_cmpint (validity_pair_hp_preflight_next (PAIR_AB_BOOTSTRAP_ROM_RECV,
++                                                     0, rom, len),
++                     ==, PAIR_NUM_STATES);
++  g_assert_cmpint (validity_pair_hp_preflight_next (PAIR_AB_BOOTSTRAP_ROM_RECV,
++                                                   0, rom, sizeof (rom)),
++                   ==, PAIR_NUM_STATES);
++  g_assert_cmpint (validity_pair_hp_preflight_next (PAIR_AB_BOOTSTRAP_ROM_RECV,
++                                                   0, NULL, 36),
++                   ==, PAIR_NUM_STATES);
++
++  /* Do not bind provisioning to the captured unit's private serial bytes. */
++  memset (rom + 16, 0xa5, 6);
++  g_assert_cmpint (validity_pair_hp_preflight_next (PAIR_AB_BOOTSTRAP_ROM_RECV,
++                                                   0, rom, 36),
++                   ==, PAIR_AB_BOOTSTRAP_IDENTIFY_SEND);
++}
++
++static void
++test_pair_hp_preflight_identity_refusal (void)
++{
++  guint8 identity[9];
++  const ValidityPairSsmState states[] = {
++    PAIR_AB_BOOTSTRAP_IDENTIFY_RECV, PAIR_AB_BOOTSTRAP_REIDENTIFY_RECV,
++  };
++
++  make_hp_preflight_identity (identity);
++  for (guint i = 0; i < G_N_ELEMENTS (states); i++)
++    {
++      /* Reserved bytes must be zero; compare the full 16-bit hardware fields.
++       * 0x71 (0x969 / FM-154-123) must not alias the captured 0x70 row. */
++      for (guint offset = 0; offset < 8; offset++)
++        {
++          identity[offset] ^= 1;
++          g_assert_cmpint (validity_pair_hp_preflight_next (states[i], 0,
++                                                           identity, 8),
++                           ==, PAIR_NUM_STATES);
++          identity[offset] ^= 1;
++        }
++
++      /* A d51 G6 identity is also outside this G5-only capture evidence. */
++      FP_WRITE_UINT16_LE (identity + 4, 0x0083);
++      g_assert_cmpint (validity_pair_hp_preflight_next (states[i], 0, identity, 8),
++                       ==, PAIR_NUM_STATES);
++      FP_WRITE_UINT16_LE (identity + 4, 0x0070);
++
++      for (gsize len = 0; len < 8; len++)
++        g_assert_cmpint (validity_pair_hp_preflight_next (states[i], 0,
++                                                         identity, len),
++                         ==, PAIR_NUM_STATES);
++      g_assert_cmpint (validity_pair_hp_preflight_next (states[i], 0, NULL, 8),
++                       ==, PAIR_NUM_STATES);
++      g_assert_cmpint (validity_pair_hp_preflight_next (states[i], 0,
++                                                       identity, sizeof (identity)),
++                       ==, PAIR_NUM_STATES);
++    }
++}
++
++static void
++test_pair_hp_preflight_register_refusal (void)
++{
++  guint8 reg[5] = { 0 };
++  const guint32 bad_values[] = { 0, 1, 4, 0xffffffff };
++
++  for (guint32 value = 2; value <= 3; value++)
++    {
++      FP_WRITE_UINT32_LE (reg, value);
++      g_assert_cmpint (validity_pair_hp_preflight_next (PAIR_AB_BOOTSTRAP_READ_REG_RECV,
++                                                       0, reg, 4),
++                       ==, PAIR_AB_BOOTSTRAP_REIDENTIFY_SEND);
++    }
++  for (guint i = 0; i < G_N_ELEMENTS (bad_values); i++)
++    {
++      FP_WRITE_UINT32_LE (reg, bad_values[i]);
++      g_assert_cmpint (validity_pair_hp_preflight_next (PAIR_AB_BOOTSTRAP_READ_REG_RECV,
++                                                       0, reg, 4),
++                       ==, PAIR_NUM_STATES);
++    }
++
++  FP_WRITE_UINT32_LE (reg, 2);
++  for (gsize len = 0; len < 4; len++)
++    g_assert_cmpint (validity_pair_hp_preflight_next (PAIR_AB_BOOTSTRAP_READ_REG_RECV,
++                                                     0, reg, len),
++                     ==, PAIR_NUM_STATES);
++  g_assert_cmpint (validity_pair_hp_preflight_next (PAIR_AB_BOOTSTRAP_READ_REG_RECV,
++                                                   0, NULL, 4),
++                   ==, PAIR_NUM_STATES);
++  g_assert_cmpint (validity_pair_hp_preflight_next (PAIR_AB_BOOTSTRAP_READ_REG_RECV,
++                                                   0, reg, sizeof (reg)),
++                   ==, PAIR_NUM_STATES);
++  g_assert_cmpint (validity_pair_hp_preflight_next (PAIR_AB_BOOTSTRAP_WRITE_REG_RECV,
++                                                   0, reg, 1),
++                   ==, PAIR_NUM_STATES);
++}
++
++static void
++test_pair_hp_preflight_response_errors (void)
++{
++  guint8 rom[36], identity[8], reg[4];
++  const ValidityPairSsmState states[] = {
++    PAIR_AB_BOOTSTRAP_ROM_RECV, PAIR_AB_BOOTSTRAP_IDENTIFY_RECV,
++    PAIR_AB_BOOTSTRAP_WRITE_REG_RECV, PAIR_AB_BOOTSTRAP_READ_REG_RECV,
++    PAIR_AB_BOOTSTRAP_REIDENTIFY_RECV, PAIR_AB_BOOTSTRAP_CLEANUPS_RECV,
++  };
++  const guint16 errors[] = { 0x0404, 0x044f, 0xffff };
++  const guint8 *payloads[] = { rom, identity, NULL, reg, identity, NULL };
++  const gsize lengths[] = { sizeof (rom), sizeof (identity), 0,
++                           sizeof (reg), sizeof (identity), 0 };
++
++  make_hp_preflight_rom (rom);
++  make_hp_preflight_identity (identity);
++  FP_WRITE_UINT32_LE (reg, 2);
++  for (guint i = 0; i < G_N_ELEMENTS (states); i++)
++    {
++      for (guint j = 0; j < G_N_ELEMENTS (errors); j++)
++        g_assert_cmpint (validity_pair_hp_preflight_next (states[i], errors[j],
++                                                         payloads[i], lengths[i]),
++                         ==, PAIR_NUM_STATES);
++      if (states[i] != PAIR_AB_BOOTSTRAP_CLEANUPS_RECV)
++        g_assert_cmpint (validity_pair_hp_preflight_next (states[i], 0x0491,
++                                                         payloads[i], lengths[i]),
++                         ==, PAIR_NUM_STATES);
++    }
++
++  /* Even a success/no-op cleanup must have its complete status-only shape. */
++  g_assert_cmpint (validity_pair_hp_preflight_next (PAIR_AB_BOOTSTRAP_CLEANUPS_RECV,
++                                                   0, reg, 1),
++                   ==, PAIR_NUM_STATES);
++  g_assert_cmpint (validity_pair_hp_preflight_next (PAIR_AB_BOOTSTRAP_CLEANUPS_RECV,
++                                                   0x0491, reg, 1),
++                   ==, PAIR_NUM_STATES);
++}
++
++static void
++test_pair_hp_preflight_unexpected_states (void)
++{
++  /* Neither starting a send nor jumping to reset/partition can count as a
++   * validated preflight response. Unknown enum values must fail closed. */
++  const ValidityPairSsmState states[] = {
++    PAIR_GET_FLASH_INFO_RECV, PAIR_VERIFY_TLS_RECV,
++    PAIR_AB_BOOTSTRAP_ROM_SEND, PAIR_AB_BOOTSTRAP_IDENTIFY_SEND,
++    PAIR_AB_BOOTSTRAP_WRITE_REG_SEND, PAIR_AB_BOOTSTRAP_READ_REG_SEND,
++    PAIR_AB_BOOTSTRAP_REIDENTIFY_SEND, PAIR_AB_BOOTSTRAP_CLEANUPS_SEND,
++    PAIR_SEND_RESET_BLOB, PAIR_PARTITION_FLASH_SEND,
++    PAIR_NUM_STATES, (ValidityPairSsmState) -1,
++  };
++
++  for (guint i = 0; i < G_N_ELEMENTS (states); i++)
++    g_assert_cmpint (validity_pair_hp_preflight_next (states[i], 0, NULL, 0),
++                     ==, PAIR_NUM_STATES);
++}
++
+ /* ================================================================
+  * T7.14: serialize_partition — known output format
+  * ================================================================ */
+@@ -6796,6 +7460,14 @@ main (int argc, char *argv[])
+                    test_fw_info_parse_present);
+   g_test_add_func ("/validity/fwext/fw-info/parse-absent",
+                    test_fw_info_parse_absent);
++  g_test_add_func ("/validity/fwext/fw-info/probe-present-and-absent",
++                   test_fw_info_probe_present_and_absent);
++  g_test_add_func ("/validity/fwext/fw-info/probe-swapped-status",
++                   test_fw_info_probe_swapped_status);
++  g_test_add_func ("/validity/fwext/fw-info/probe-errors",
++                   test_fw_info_probe_errors);
++  g_test_add_func ("/validity/fwext/fw-info/probe-truncated-status",
++                   test_fw_info_probe_truncated_status);
+   g_test_add_func ("/validity/fwext/fw-info/parse-unknown-status",
+                    test_fw_info_parse_unknown_status);
+   g_test_add_func ("/validity/fwext/fw-info/parse-truncated",
+@@ -6968,6 +7640,15 @@ main (int argc, char *argv[])
+   g_test_add_func ("/validity/recovery/classify_error",
+                    test_classify_error);
+ 
++  g_test_add_func ("/validity/cancel/verify-wait", test_cancel_verify_wait);
++  g_test_add_func ("/validity/cancel/identify-match-wait", test_cancel_identify_match_wait);
++  g_test_add_func ("/validity/cancel/enroll-capture-wait", test_cancel_enroll_capture_wait);
++  g_test_add_func ("/validity/cancel/enroll-pending-write", test_cancel_enroll_pending_write);
++  g_test_add_func ("/validity/cancel/between-states", test_cancel_between_states);
++  g_test_add_func ("/validity/cancel/cleanup-failures", test_cancel_cleanup_failures);
++  g_test_add_func ("/validity/cancel/during-command-error", test_cancel_during_command_error);
++  g_test_add_func ("/validity/cancel/skip-other-results", test_cancel_cleanup_skips_other_results);
++
+ 
+   /* TLS tests */
+ 
+@@ -7025,6 +7706,18 @@ main (int argc, char *argv[])
+   g_test_add_func ("/validity/pair/classify-tls-flash/truncated",
+                    test_pair_classify_truncated);
+   g_test_add_func ("/validity/pair/decide", test_pair_decide);
++  g_test_add_func ("/validity/pair/hp-preflight/sequence",
++                   test_pair_hp_preflight_sequence);
++  g_test_add_func ("/validity/pair/hp-preflight/rom-refusal",
++                   test_pair_hp_preflight_rom_refusal);
++  g_test_add_func ("/validity/pair/hp-preflight/identity-refusal",
++                   test_pair_hp_preflight_identity_refusal);
++  g_test_add_func ("/validity/pair/hp-preflight/register-refusal",
++                   test_pair_hp_preflight_register_refusal);
++  g_test_add_func ("/validity/pair/hp-preflight/response-errors",
++                   test_pair_hp_preflight_response_errors);
++  g_test_add_func ("/validity/pair/hp-preflight/unexpected-states",
++                   test_pair_hp_preflight_unexpected_states);
+   g_test_add_func ("/validity/pair/serialize-partition",
+                    test_serialize_partition);
+   g_test_add_func ("/validity/pair/make-cert-size",

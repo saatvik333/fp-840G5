@@ -1,0 +1,3 @@
+# Preserve exported patch context and the verbatim upstream license text.
+*.patch -whitespace
+LICENSE -whitespace
