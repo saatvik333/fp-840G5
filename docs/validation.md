@@ -38,7 +38,13 @@ and tester confirmation, not inferred from USB status.
 
 ## Automated verification
 
-Six unit suites include 219 Validity cases. Four default delete/clear guard checks
+The released alpha.2 has 219 Validity cases. The unreleased scan-review candidate
+has 225, including capture classification, byte-identical command caching and
+retry/protocol-error reporting through real libfprint verify/identify actions
+with fake device I/O. The earlier hardware results above apply to the preceding
+implementation; candidate improvements await hardware retesting.
+
+Six unit suites pass. Four default delete/clear guard checks
 and six mock production-policy/delegation checks pass without hardware. Separate
 local loader checks verify the actual HP reset/firmware/common data. Python tests
 cover container corruption/truncation and installer refusal of unknown ROM,
@@ -68,3 +74,9 @@ firmware upload; fresh-system root activation with the generalized installer.
 CLI enrollment and visible Settings are not reported as GUI enrollment testing.
 With one host-known print, fprintd's `any` request still uses verification;
 gallery identification needs at least two host-known prints.
+
+The later scan-review session used a changed enrollment set and was stopped
+at the tester's request to analyze and fix code first. It produced mixed genuine
+outcomes and five unenrolled-finger rejections. One armed attempt had no touch
+instruction and is unsuitable for accuracy analysis. Prompt-to-result timings
+included chat/human delay and are not scanner latency. See [performance review](performance.md).

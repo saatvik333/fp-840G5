@@ -1,9 +1,9 @@
 diff --git a/libfprint/drivers/validity/validity.c b/libfprint/drivers/validity/validity.c
-index 4f71db6..46e2950 100644
+index 4f71db6..0ef6c86 100644
 --- a/libfprint/drivers/validity/validity.c
 +++ b/libfprint/drivers/validity/validity.c
 @@ -1,3 +1,4 @@
-+/* Modified 2026-10-13 by Saatvik Sharma: recover an idle capture boundary before calibration. */
++/* Modified 2026-10-13 by Saatvik Sharma: recover an idle capture boundary before calibration and invalidate cached commands on lifecycle changes. */
  /*
   * Main driver for Validity/Synaptics VCSFW fingerprint sensors
   *
@@ -60,7 +60,37 @@ index 4f71db6..46e2950 100644
  
    fpi_ssm_next_state (transfer->ssm);
  }
-@@ -1409,6 +1408,43 @@ open_run_state (FpiSsm   *ssm,
+@@ -956,13 +955,14 @@ open_sensor_identify_recv (FpiSsm            *ssm,
+       return;
+     }
+ 
+-  {
+-    GString *hex = g_string_new ("identify_sensor raw: ");
+-    for (gsize i = 0; i < self->cmd_response_len; i++)
+-      g_string_append_printf (hex, "%02x ", self->cmd_response_data[i]);
+-    fp_dbg ("%s", hex->str);
+-    g_string_free (hex, TRUE);
+-  }
++  if (!g_log_writer_default_would_drop (G_LOG_LEVEL_DEBUG, G_LOG_DOMAIN))
++    {
++      GString *hex = g_string_new ("identify_sensor raw: ");
++      for (gsize i = 0; i < self->cmd_response_len; i++)
++        g_string_append_printf (hex, "%02x ", self->cmd_response_data[i]);
++      fp_dbg ("%s", hex->str);
++      g_string_free (hex, TRUE);
++    }
+ 
+   if (!validity_sensor_parse_identify (self->cmd_response_data,
+                                        self->cmd_response_len,
+@@ -1137,6 +1137,7 @@ open_calibrate_build (FpiSsm            *ssm,
+     }
+ 
+   self->calib_iteration = 0;
++  validity_verify_clear_capture_cache (self);
+   g_clear_pointer (&self->capture.calib_data, g_free);
+   self->capture.calib_data_len = 0;
+ 
+@@ -1409,6 +1410,43 @@ open_run_state (FpiSsm   *ssm,
        open_capture_setup (ssm, self);
        break;
  
@@ -104,12 +134,20 @@ index 4f71db6..46e2950 100644
      case OPEN_CALIBRATE_BUILD:
        open_calibrate_build (ssm, self);
        break;
+@@ -1652,6 +1690,7 @@ validity_release_state (FpiDeviceValidity *self)
+   validity_user_storage_clear (&self->list_storage);
+   validity_user_clear (&self->verify_match_user);
+ 
++  validity_verify_clear_capture_cache (self);
+   validity_capture_state_clear (&self->capture);
+   validity_sensor_state_clear (&self->sensor);
+   validity_pair_state_free (&self->pair_state);
 diff --git a/libfprint/drivers/validity/validity.h b/libfprint/drivers/validity/validity.h
-index 98d9218..8199b43 100644
+index 98d9218..d5d0eec 100644
 --- a/libfprint/drivers/validity/validity.h
 +++ b/libfprint/drivers/validity/validity.h
 @@ -1,3 +1,4 @@
-+/* Modified 2026-10-13 by Saatvik Sharma: declare bounded cancellation cleanup state. */
++/* Modified 2026-10-13 by Saatvik Sharma: declare bounded cleanup, capture outcomes and a per-calibration command cache. */
  /*
   * Validity/Synaptics VCSFW fingerprint sensor driver
   *
@@ -142,7 +180,7 @@ index 98d9218..8199b43 100644
    ENROLL_NUM_STATES,
  } ValidityEnrollState;
  
-@@ -212,6 +228,10 @@ typedef enum {
+@@ -212,9 +228,22 @@ typedef enum {
    VERIFY_GET_MATCH_USER,       /* read the matched user record (cmd 0x4a) */
    VERIFY_GET_MATCH_USER_RECV,
    VERIFY_DONE,
@@ -153,7 +191,19 @@ index 98d9218..8199b43 100644
    VERIFY_NUM_STATES,
  } ValidityVerifyState;
  
-@@ -313,6 +333,7 @@ struct _FpiDeviceValidity
++/* Capture status separates no-finger retries from unusable contact and bad replies. */
++typedef enum
++{
++  VALIDITY_VERIFY_CAPTURE_VALID,
++  VALIDITY_VERIFY_CAPTURE_EMPTY,
++  VALIDITY_VERIFY_CAPTURE_RETRY,
++  VALIDITY_VERIFY_CAPTURE_INVALID,
++} ValidityVerifyCaptureOutcome;
++
+ /* List prints SSM states */
+ typedef enum {
+   LIST_GET_STORAGE = 0,
+@@ -313,10 +342,14 @@ struct _FpiDeviceValidity
    gboolean enroll_frame_rejected;   /* sensor rejected (0x0526) or flagged the last frame -- retry stage */
    guint    enroll_reject_retries;   /* cumulative frame retries -- bounds broken-firmware loops */
    gint     enroll_reported;         /* highest completed_stages reported this action */
@@ -161,7 +211,14 @@ index 98d9218..8199b43 100644
  
    /* Verify: retry state for empty/phantom captures (no finger down) */
    guint    verify_capture_retries;
-@@ -412,6 +433,26 @@ typedef enum {
+   gboolean verify_recapture;
++  ValidityVerifyCaptureOutcome verify_capture_outcome;
++  guint8  *verify_capture_cmd;
++  gsize    verify_capture_cmd_len;
+ 
+   /* Verify/identify mode flag: TRUE = identify, FALSE = verify */
+   gboolean identify_mode;
+@@ -412,6 +445,26 @@ typedef enum {
  ValidityErrClass validity_classify_error (const GError *error,
                                            gboolean      device_alive);
  
@@ -188,6 +245,57 @@ index 98d9218..8199b43 100644
  /* Liveness probe: TRUE if the sensor still answers on the bus (a reset that
   * only dropped the session) vs FALSE if it has left (re-enumeration). Does one
   * cheap control request; only call off the hot path (i.e. on an error). */
+@@ -447,6 +500,15 @@ void validity_list (FpDevice *device);
+ void validity_delete (FpDevice *device);
+ void validity_clear_storage (FpDevice *device);
+ 
++ValidityVerifyCaptureOutcome validity_verify_classify_capture (guint16       status,
++                                                               const guint8 *data,
++                                                               gsize         data_len);
++gboolean validity_verify_complete_capture_outcome (FpDevice                    *device,
++                                                     ValidityVerifyCaptureOutcome outcome);
++const guint8 *validity_verify_get_capture_command (FpiDeviceValidity *self,
++                                                    gsize             *out_len);
++void validity_verify_clear_capture_cache (FpiDeviceValidity *self);
++
+ /* Match correlation helpers (validity_verify.c) -- exposed for unit testing */
+ gboolean validity_print_matches_record (FpPrint                   *print,
+                                         const ValidityMatchResult *match,
+diff --git a/libfprint/drivers/validity/validity_capture.c b/libfprint/drivers/validity/validity_capture.c
+index 578d815..96ffd0a 100644
+--- a/libfprint/drivers/validity/validity_capture.c
++++ b/libfprint/drivers/validity/validity_capture.c
+@@ -1,3 +1,4 @@
++/* Modified 2026-10-13 by Saatvik Sharma: avoid formatting command dumps when debug logging is disabled. */
+ /*
+  * Capture program infrastructure for Validity/Synaptics VCSFW sensors
+  *
+@@ -1107,15 +1108,16 @@ validity_capture_build_cmd_02 (const ValidityCaptureState   *capture,
+   }
+ 
+   /* Debug: dump first 200 bytes of capture command for comparison with PY */
+-  {
+-    GString *hex = g_string_new ("");
+-    gsize dump_len = MIN (*out_len, 200);
+-    for (gsize i = 0; i < dump_len; i++)
+-      g_string_append_printf (hex, "%02x", cmd[i]);
+-    fp_dbg ("cmd_02 mode=%d len=%zu first %zu bytes: %s",
+-            mode, *out_len, dump_len, hex->str);
+-    g_string_free (hex, TRUE);
+-  }
++  if (!g_log_writer_default_would_drop (G_LOG_LEVEL_DEBUG, G_LOG_DOMAIN))
++    {
++      GString *hex = g_string_new ("");
++      gsize dump_len = MIN (*out_len, 200);
++      for (gsize i = 0; i < dump_len; i++)
++        g_string_append_printf (hex, "%02x", cmd[i]);
++      fp_dbg ("cmd_02 mode=%d len=%zu first %zu bytes: %s",
++              mode, *out_len, dump_len, hex->str);
++      g_string_free (hex, TRUE);
++    }
+ 
+   return cmd;
+ }
 diff --git a/libfprint/drivers/validity/validity_data.c b/libfprint/drivers/validity/validity_data.c
 index f90fb26..a1e6e2d 100644
 --- a/libfprint/drivers/validity/validity_data.c
@@ -792,11 +900,11 @@ index 71988d8..b9a8d1b 100644
  #define VCSFW_CMD_CLEANUPS 0x1a
  
 diff --git a/libfprint/drivers/validity/validity_verify.c b/libfprint/drivers/validity/validity_verify.c
-index 157556a..90fde86 100644
+index 157556a..2575863 100644
 --- a/libfprint/drivers/validity/validity_verify.c
 +++ b/libfprint/drivers/validity/validity_verify.c
 @@ -1,3 +1,4 @@
-+/* Modified 2026-10-13 by Saatvik Sharma: finish sensor cleanup after verification cancellation. */
++/* Modified 2026-10-13 by Saatvik Sharma: preserve cancellation cleanup and distinguish unusable captures with ready/finger feedback. */
  /*
   * Verify and Identify state machines for Validity/Synaptics VCSFW sensors
   *
@@ -939,7 +1047,148 @@ index 157556a..90fde86 100644
        fpi_ssm_mark_failed (ssm, error);
        return;
      }
-@@ -641,6 +753,19 @@ verify_run_state (FpiSsm   *ssm,
+@@ -123,6 +235,7 @@ verify_interrupt_cb (FpiUsbTransfer *transfer,
+     {
+       if (int_type == VALIDITY_INT_FINGER_DOWN)
+         {
++          fpi_device_report_finger_status (device, FP_FINGER_STATUS_PRESENT);
+           fpi_ssm_next_state (ssm);
+           return;
+         }
+@@ -518,15 +631,34 @@ validity_verify_clear_match_state (FpiDeviceValidity *self)
+  * Verify/Identify SSM
+  * ================================================================ */
+ 
++void
++validity_verify_clear_capture_cache (FpiDeviceValidity *self)
++{
++  g_clear_pointer (&self->verify_capture_cmd, g_free);
++  self->verify_capture_cmd_len = 0;
++}
++
++/* IDENTIFY's command depends only on this open session's calibrated capture
++ * state. TLS encrypts a fresh record for every send; only the plaintext command
++ * is cached. Close, recovery and recalibration invalidate it. */
++const guint8 *
++validity_verify_get_capture_command (FpiDeviceValidity *self,
++                                     gsize             *out_len)
++{
++  if (!self->verify_capture_cmd)
++    self->verify_capture_cmd = validity_capture_build_cmd_02 (
++      &self->capture, self->sensor.type_info, VALIDITY_CAPTURE_IDENTIFY,
++      &self->verify_capture_cmd_len);
++  *out_len = self->verify_capture_cmd_len;
++  return self->verify_capture_cmd;
++}
++
+ static void
+ verify_build_capture (FpiSsm            *ssm,
+                       FpiDeviceValidity *self)
+ {
+   gsize cmd_len;
+-  guint8 *cmd = validity_capture_build_cmd_02 (&self->capture,
+-                                               self->sensor.type_info,
+-                                               VALIDITY_CAPTURE_IDENTIFY,
+-                                               &cmd_len);
++  const guint8 *cmd = validity_verify_get_capture_command (self, &cmd_len);
+ 
+   if (!cmd)
+     {
+@@ -537,7 +669,6 @@ verify_build_capture (FpiSsm            *ssm,
+     }
+ 
+   vcsfw_tls_cmd_send (self, ssm, cmd, cmd_len, NULL);
+-  g_free (cmd);
+ }
+ 
+ static void
+@@ -552,6 +683,7 @@ verify_capture_recv (FpiSsm            *ssm,
+                            fpi_device_error_new (FP_DEVICE_ERROR_PROTO));
+       return;
+     }
++  fpi_device_report_finger_status (FP_DEVICE (self), FP_FINGER_STATUS_NEEDED);
+   fpi_ssm_next_state (ssm);
+ }
+ 
+@@ -603,7 +735,8 @@ verify_get_match_user (FpiSsm            *ssm,
+    * with the print(s) being matched. Nothing to read on a no-match. */
+   guint16 user_dbid;
+ 
+-  if (!validity_match_user_to_read (self->bulk_data, self->bulk_data_len,
++  if (self->verify_capture_outcome != VALIDITY_VERIFY_CAPTURE_VALID ||
++      !validity_match_user_to_read (self->bulk_data, self->bulk_data_len,
+                                     &user_dbid))
+     {
+       fpi_ssm_jump_to_state (ssm, VERIFY_DONE);
+@@ -635,17 +768,93 @@ verify_get_match_user_recv (FpiSsm            *ssm,
+   fpi_ssm_next_state (ssm);
+ }
+ 
++/* The status payload is length(4 LE) followed by x/y/w1/w2/error (12 bytes).
++ * No-finger captures are distinct from non-empty frames the chip rejected.
++ * Do not match flawed frames or wait silently for a finger already placed. */
++ValidityVerifyCaptureOutcome
++validity_verify_classify_capture (guint16       status,
++                                  const guint8 *data,
++                                  gsize         data_len)
++{
++  guint16 x, y;
++  guint32 err;
++
++  if (status != VCSFW_STATUS_OK || !data || data_len != 16 ||
++      FP_READ_UINT32_LE (data) != 12)
++    return VALIDITY_VERIFY_CAPTURE_INVALID;
++
++  x = FP_READ_UINT16_LE (data + 4);
++  y = FP_READ_UINT16_LE (data + 6);
++  err = FP_READ_UINT32_LE (data + 12);
++
++  if (x == 0 && y == 0)
++    return VALIDITY_VERIFY_CAPTURE_EMPTY;
++  if (err != 0 || x == 0 || y == 0)
++    return VALIDITY_VERIFY_CAPTURE_RETRY;
++  return VALIDITY_VERIFY_CAPTURE_VALID;
++}
++
++/* Called only after capture-stop, match cleanup and LED-off completed. Retry
++ * errors go through report(), then complete(NULL), as required by libfprint.
++ * A malformed reply is a device protocol failure, never a match or retry. */
++gboolean
++validity_verify_complete_capture_outcome (FpDevice                    *dev,
++                                          ValidityVerifyCaptureOutcome outcome)
++{
++  gboolean identify = fpi_device_get_current_action (dev) == FPI_DEVICE_ACTION_IDENTIFY;
++
++  if (outcome == VALIDITY_VERIFY_CAPTURE_INVALID)
++    {
++      GError *error = fpi_device_error_new (FP_DEVICE_ERROR_PROTO);
++      if (identify)
++        fpi_device_identify_complete (dev, error);
++      else
++        fpi_device_verify_complete (dev, error);
++      return TRUE;
++    }
++  if (outcome == VALIDITY_VERIFY_CAPTURE_RETRY)
++    {
++      GError *error = fpi_device_retry_new (FP_DEVICE_RETRY_REMOVE_FINGER);
++      if (identify)
++        {
++          fpi_device_identify_report (dev, NULL, NULL, error);
++          fpi_device_identify_complete (dev, NULL);
++        }
++      else
++        {
++          fpi_device_verify_report (dev, FPI_MATCH_ERROR, NULL, error);
++          fpi_device_verify_complete (dev, NULL);
++        }
++      return TRUE;
++    }
++  return FALSE;
++}
++
+ static void
+ verify_run_state (FpiSsm   *ssm,
+                   FpDevice *dev)
  {
    FpiDeviceValidity *self = FPI_DEVICE_VALIDITY (dev);
  
@@ -959,7 +1208,89 @@ index 157556a..90fde86 100644
    switch (fpi_ssm_get_cur_state (ssm))
      {
      case VERIFY_LED_ON:
-@@ -863,10 +988,25 @@ verify_ssm_done (FpiSsm   *ssm,
+       self->verify_capture_retries = 0;
+       self->verify_recapture = FALSE;
++      self->verify_capture_outcome = VALIDITY_VERIFY_CAPTURE_VALID;
+       /* The match decision must come from this attempt's get_match_result
+        * alone; drop anything an earlier action left behind. */
+       validity_verify_clear_match_state (self);
+@@ -688,43 +897,26 @@ verify_run_state (FpiSsm   *ssm,
+       break;
+ 
+     case VERIFY_GET_PRG_STATUS_RECV:
+-      /* Capture status: len(4) | x(2) | y(2) | w1(2) | w2(2) | error(4).
+-       * A real finger reports non-zero geometry and error==0. An empty
+-       * "phantom" capture (no finger on the sensor) reports x=0/y=0 and a
+-       * non-zero error. python-validity raises on this and its identify loop
+-       * re-captures; mirror that so verify waits for a real finger instead of
+-       * running a match that can only fail. */
+-      {
+-        gboolean empty = TRUE;
+-
+-        if (self->cmd_response_data && self->cmd_response_len >= 16)
+-          {
+-            const guint8 *d = self->cmd_response_data;
+-            guint16 x   = d[4]  | (d[5] << 8);
+-            guint16 y   = d[6]  | (d[7] << 8);
+-            guint16 w1  = d[8]  | (d[9] << 8);
+-            guint16 w2  = d[10] | (d[11] << 8);
+-            guint32 err = d[12] | (d[13] << 8) | (d[14] << 16) | ((guint32) d[15] << 24);
+-            fp_dbg ("Verify capture status: x=%u y=%u w1=%u w2=%u error=0x%08x",
+-                    x, y, w1, w2, err);
+-            empty = (err != 0 || x == 0 || y == 0);
+-          }
+-
+-        if (empty)
+-          {
+-            /* No finger on the sensor yet. Re-arm and wait. Like every other
+-             * finger-wait in this driver, this is unbounded and terminated by
+-             * the operation's GCancellable (fprintd's timeout or a user
+-             * cancel) rather than a fixed driver-side timeout. */
+-            self->verify_recapture = TRUE;
+-            fp_dbg ("Verify: empty capture (no finger yet) -- re-arming (attempt %u)",
++      self->verify_capture_outcome = validity_verify_classify_capture (
++        self->cmd_response_status, self->cmd_response_data, self->cmd_response_len);
++      self->verify_recapture = self->verify_capture_outcome == VALIDITY_VERIFY_CAPTURE_EMPTY;
++      if (self->verify_capture_outcome == VALIDITY_VERIFY_CAPTURE_VALID)
++        {
++          self->verify_capture_retries = 0;
++          /* The 0xd51 may not emit a distinct finger-down. Confirmed usable
++           * geometry is its reliable presence event, after acquisition. */
++          fpi_device_report_finger_status (dev, FP_FINGER_STATUS_PRESENT);
++        }
++      else
++        {
++          fpi_device_report_finger_status (dev, FP_FINGER_STATUS_NONE);
++          if (self->verify_recapture)
++            fp_dbg ("Verify: empty capture -- waiting for finger (attempt %u)",
+                     ++self->verify_capture_retries);
+-          }
+-        else
+-          {
+-            self->verify_capture_retries = 0;
+-          }
+-      }
++          else
++            fp_dbg ("Verify: unusable capture outcome %u -- cleaning up before reporting",
++                    self->verify_capture_outcome);
++        }
+       fpi_ssm_next_state (ssm);
+       break;
+ 
+@@ -744,6 +936,12 @@ verify_run_state (FpiSsm   *ssm,
+           self->verify_recapture = FALSE;
+           fpi_ssm_jump_to_state_delayed (ssm, VERIFY_BUILD_CAPTURE, 300);
+         }
++      else if (self->verify_capture_outcome != VALIDITY_VERIFY_CAPTURE_VALID)
++        {
++          /* Finish normal cleanup before reporting retry or protocol error.
++           * The unusable frame must never reach the matching command. */
++          fpi_ssm_jump_to_state (ssm, VERIFY_CLEANUP);
++        }
+       else
+         {
+           fpi_ssm_next_state (ssm);
+@@ -863,10 +1061,25 @@ verify_ssm_done (FpiSsm   *ssm,
  {
    FpiDeviceValidity *self = FPI_DEVICE_VALIDITY (dev);
  
@@ -985,7 +1316,20 @@ index 157556a..90fde86 100644
        /* Recoverable mid-operation reset? Reconnect and retry instead of
         * failing the action (bounded; a true removal falls through). */
        if (validity_recover_or_fail (self, error, verify_reconnect_done,
-@@ -1051,7 +1191,8 @@ validity_verify (FpDevice *device)
+@@ -884,6 +1097,12 @@ verify_ssm_done (FpiSsm   *ssm,
+       return;
+     }
+ 
++  if (validity_verify_complete_capture_outcome (dev, self->verify_capture_outcome))
++    {
++      validity_verify_clear_match_state (self);
++      return;
++    }
++
+   /* Parse stored match result */
+   MatchResult match = { 0 };
+   gboolean have_match = FALSE;
+@@ -1051,7 +1270,8 @@ validity_verify (FpDevice *device)
    else
      self->reconnect_attempts = 0;        /* fresh action -- reset the budget */
  
@@ -995,7 +1339,7 @@ index 157556a..90fde86 100644
    fpi_ssm_start (ssm, verify_ssm_done);
  }
  
-@@ -1075,7 +1216,8 @@ validity_identify (FpDevice *device)
+@@ -1075,7 +1295,8 @@ validity_identify (FpDevice *device)
    else
      self->reconnect_attempts = 0;
  
@@ -1005,6 +1349,45 @@ index 157556a..90fde86 100644
    fpi_ssm_start (ssm, verify_ssm_done);
  }
  
+diff --git a/libfprint/drivers/validity/vcsfw_protocol.c b/libfprint/drivers/validity/vcsfw_protocol.c
+index 75d4eb0..cceba3a 100644
+--- a/libfprint/drivers/validity/vcsfw_protocol.c
++++ b/libfprint/drivers/validity/vcsfw_protocol.c
+@@ -1,3 +1,4 @@
++/* Modified 2026-10-13 by Saatvik Sharma: avoid formatting response dumps when debug logging is disabled. */
+ /*
+  * VCSFW protocol implementation for Validity/Synaptics fingerprint sensors
+  *
+@@ -218,17 +219,18 @@ tls_cmd_receive_cb (FpiUsbTransfer *transfer,
+       return;
+     }
+ 
+-  /* Decrypt TLS app data response */
+-  {
+-    GString *hex = g_string_new ("VCSFW TLS raw response: ");
+-    for (gsize i = 0; i < MIN ((gsize) transfer->actual_length, (gsize) 40); i++)
+-      g_string_append_printf (hex, "%02x ", transfer->buffer[i]);
+-    if (transfer->actual_length > 40)
+-      g_string_append_printf (hex, "... (%" G_GSSIZE_FORMAT " total)",
+-                              transfer->actual_length);
+-    fp_dbg ("%s", hex->str);
+-    g_string_free (hex, TRUE);
+-  }
++  if (!g_log_writer_default_would_drop (G_LOG_LEVEL_DEBUG, G_LOG_DOMAIN))
++    {
++      GString *hex = g_string_new ("VCSFW TLS raw response: ");
++      for (gsize i = 0; i < MIN ((gsize) transfer->actual_length, (gsize) 40); i++)
++        g_string_append_printf (hex, "%02x ", transfer->buffer[i]);
++      if (transfer->actual_length > 40)
++        g_string_append_printf (hex, "... (%" G_GSSIZE_FORMAT " total)",
++                                transfer->actual_length);
++      fp_dbg ("%s", hex->str);
++      g_string_free (hex, TRUE);
++    }
++  /* Decrypt every response regardless of logging. */
+   gsize decrypted_len;
+   guint8 *decrypted = validity_tls_unwrap_response (
+     &self->tls,
 diff --git a/libfprint/drivers/validity/vcsfw_protocol.h b/libfprint/drivers/validity/vcsfw_protocol.h
 index b961fcc..01adf14 100644
 --- a/libfprint/drivers/validity/vcsfw_protocol.h
@@ -1041,11 +1424,11 @@ index 41aac84..16a96b0 100644
  cc = meson.get_compiler('c')
  cpp = meson.get_compiler('cpp')
 diff --git a/tests/test-validity.c b/tests/test-validity.c
-index 3bb5d26..f46006e 100644
+index 3bb5d26..3fe5540 100644
 --- a/tests/test-validity.c
 +++ b/tests/test-validity.c
 @@ -1,3 +1,4 @@
-+/* Modified 2026-10-13 by Saatvik Sharma: test HP preflight, firmware status, data lookup and cancellation. */
++/* Modified 2026-10-13 by Saatvik Sharma: test HP preflight, firmware status, data lookup, cancellation, capture outcomes and cache invalidation. */
  /*
   * Unit tests for the validity (VCSFW) fingerprint driver
   *
@@ -1167,7 +1550,184 @@ index 3bb5d26..f46006e 100644
  /* ================================================================
   * T3.2b: test_fw_info_parse_unknown_status
   *
-@@ -3450,6 +3546,348 @@ test_classify_error (void)
+@@ -2881,6 +2977,176 @@ test_user_get_id (void)
+  * ================================================================ */
+ 
+ /* Verify reports a match only for the print whose record the chip matched */
++static void
++test_verify_capture_status (void)
++{
++  guint8 reply[17] = { 0 };
++  FP_WRITE_UINT32_LE (reply, 12);
++  FP_WRITE_UINT16_LE (reply + 4, 112);
++  FP_WRITE_UINT16_LE (reply + 6, 112);
++  g_assert_cmpint (validity_verify_classify_capture (VCSFW_STATUS_OK, reply, 16),
++                   ==, VALIDITY_VERIFY_CAPTURE_VALID);
++
++  /* A flagged, non-empty contact needs lift/retry feedback, not an invisible
++   * no-finger loop. Never send this frame to the chip's matching command. */
++  FP_WRITE_UINT32_LE (reply + 12, 0x1234);
++  g_assert_cmpint (validity_verify_classify_capture (VCSFW_STATUS_OK, reply, 16),
++                   ==, VALIDITY_VERIFY_CAPTURE_RETRY);
++
++  /* A truly empty capture remains a wait for physical input. */
++  FP_WRITE_UINT16_LE (reply + 4, 0);
++  FP_WRITE_UINT16_LE (reply + 6, 0);
++  g_assert_cmpint (validity_verify_classify_capture (VCSFW_STATUS_OK, reply, 16),
++                   ==, VALIDITY_VERIFY_CAPTURE_EMPTY);
++  FP_WRITE_UINT32_LE (reply + 12, 0);
++  g_assert_cmpint (validity_verify_classify_capture (VCSFW_STATUS_OK, reply, 16),
++                   ==, VALIDITY_VERIFY_CAPTURE_EMPTY);
++
++  /* Partial geometry is not a valid frame and is not an untouched reader. */
++  FP_WRITE_UINT16_LE (reply + 6, 112);
++  g_assert_cmpint (validity_verify_classify_capture (VCSFW_STATUS_OK, reply, 16),
++                   ==, VALIDITY_VERIFY_CAPTURE_RETRY);
++
++  /* A bad transport/protocol reply must not masquerade as finger waiting. */
++  g_assert_cmpint (validity_verify_classify_capture (0x0450, reply, 16),
++                   ==, VALIDITY_VERIFY_CAPTURE_INVALID);
++  g_assert_cmpint (validity_verify_classify_capture (VCSFW_STATUS_OK, NULL, 16),
++                   ==, VALIDITY_VERIFY_CAPTURE_INVALID);
++  for (gsize len = 0; len < 16; len++)
++    g_assert_cmpint (validity_verify_classify_capture (VCSFW_STATUS_OK, reply, len),
++                     ==, VALIDITY_VERIFY_CAPTURE_INVALID);
++  g_assert_cmpint (validity_verify_classify_capture (VCSFW_STATUS_OK, reply, 17),
++                   ==, VALIDITY_VERIFY_CAPTURE_INVALID);
++  FP_WRITE_UINT32_LE (reply, 11);
++  g_assert_cmpint (validity_verify_classify_capture (VCSFW_STATUS_OK, reply, 16),
++                   ==, VALIDITY_VERIFY_CAPTURE_INVALID);
++}
++
++static void
++capture_failure_fake_action (FpDevice *dev)
++{
++  FpiDeviceFake *fake = FPI_DEVICE_FAKE (dev);
++  ValidityVerifyCaptureOutcome outcome = GPOINTER_TO_UINT (fake->user_data);
++  fpi_device_report_finger_status (dev, FP_FINGER_STATUS_NEEDED);
++  g_assert_true (validity_verify_complete_capture_outcome (dev, outcome));
++}
++
++static void
++capture_failure_match_cb (FpDevice *dev,
++                           FpPrint *match,
++                           FpPrint *print,
++                           gpointer user_data,
++                           GError *error)
++{
++  guint *reports = user_data;
++  g_assert_true (FP_IS_DEVICE (dev));
++  g_assert_null (match);
++  g_assert_null (print);
++  g_assert_error (error, FP_DEVICE_RETRY, FP_DEVICE_RETRY_REMOVE_FINGER);
++  (*reports)++;
++}
++
++static void
++test_verify_capture_failure_api (gconstpointer data)
++{
++  guint flags = GPOINTER_TO_UINT (data);
++  gboolean identify = flags & 4;
++  ValidityVerifyCaptureOutcome outcome = flags & 3;
++  g_autoptr(FpDevice) dev = g_object_new (FPI_TYPE_DEVICE_FAKE, NULL);
++  g_autoptr(FpPrint) print = g_object_ref_sink (fp_print_new (dev));
++  g_autoptr(GError) error = NULL;
++  FpDeviceClass *klass = FP_DEVICE_GET_CLASS (dev);
++  void (*saved_verify) (FpDevice *) = klass->verify;
++  void (*saved_identify) (FpDevice *) = klass->identify;
++  guint reports = 0;
++  gboolean matched = TRUE;
++  gboolean success;
++
++  fpi_print_set_type (print, FPI_PRINT_RAW);
++  g_object_set (print, "fpi-data", g_variant_new_string ("synthetic-capture-test"), NULL);
++  FPI_DEVICE_FAKE (dev)->user_data = GUINT_TO_POINTER (outcome);
++  g_assert_true (fp_device_open_sync (dev, NULL, &error));
++  g_assert_no_error (error);
++  klass->verify = capture_failure_fake_action;
++  klass->identify = capture_failure_fake_action;
++  if (identify)
++    {
++      g_autoptr(GPtrArray) gallery = g_ptr_array_new ();
++      g_ptr_array_add (gallery, print);
++      success = fp_device_identify_sync (dev, gallery, NULL,
++                                         capture_failure_match_cb, &reports,
++                                         NULL, NULL, &error);
++    }
++  else
++    success = fp_device_verify_sync (dev, print, NULL,
++                                     capture_failure_match_cb, &reports,
++                                     &matched, NULL, &error);
++  klass->verify = saved_verify;
++  klass->identify = saved_identify;
++  g_assert_false (success);
++  if (outcome == VALIDITY_VERIFY_CAPTURE_RETRY)
++    {
++      g_assert_error (error, FP_DEVICE_RETRY, FP_DEVICE_RETRY_REMOVE_FINGER);
++      g_assert_cmpuint (reports, ==, 1);
++    }
++  else
++    {
++      g_assert_error (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO);
++      g_assert_cmpuint (reports, ==, 0);
++    }
++  if (!identify)
++    g_assert_false (matched);
++  g_assert_cmpuint (fp_device_get_finger_status (dev), ==, FP_FINGER_STATUS_NONE);
++  g_clear_error (&error);
++  g_assert_true (fp_device_close_sync (dev, NULL, &error));
++  g_assert_no_error (error);
++}
++
++/* Compare cache output with the unmodified command builder, then change
++ * calibration and invalidate. No enrolled fingerprint or real USB input. */
++static void
++test_verify_capture_cache (void)
++{
++  FpiDeviceValidity self = { 0 };
++  const ValiditySensorTypeInfo *info = validity_sensor_type_info_lookup (0x0199);
++  gsize len, reference_len;
++  const guint8 *first, *second;
++  g_autofree guint8 *reference = NULL;
++  g_autoptr(GBytes) old = NULL;
++
++  self.sensor.type_info = info;
++  g_assert_true (validity_capture_state_setup (&self.capture, info, 0x0d51, 6, 7, NULL, 0));
++  self.capture.factory_calibration_values_len = info->lines_per_calibration_data;
++  self.capture.factory_calibration_values = g_malloc0 (self.capture.factory_calibration_values_len);
++  self.capture.calib_data_len = (gsize) info->bytes_per_line * info->lines_per_calibration_data;
++  self.capture.calib_data = g_malloc0 (self.capture.calib_data_len);
++  reference = validity_capture_build_cmd_02 (&self.capture, info,
++                                             VALIDITY_CAPTURE_IDENTIFY, &reference_len);
++  g_assert_nonnull (reference);
++  first = validity_verify_get_capture_command (&self, &len);
++  g_assert_nonnull (first);
++  g_assert_cmpmem (first, len, reference, reference_len);
++  old = g_bytes_new (first, len);
++  second = validity_verify_get_capture_command (&self, &len);
++  g_assert_true (first == second);
++
++  validity_verify_clear_capture_cache (&self);
++  g_assert_null (self.verify_capture_cmd);
++  g_assert_cmpuint (self.verify_capture_cmd_len, ==, 0);
++  self.capture.calib_data[8] = 1;
++  g_clear_pointer (&reference, g_free);
++  reference = validity_capture_build_cmd_02 (&self.capture, info,
++                                             VALIDITY_CAPTURE_IDENTIFY, &reference_len);
++  second = validity_verify_get_capture_command (&self, &len);
++  g_assert_nonnull (second);
++  g_assert_cmpmem (second, len, reference, reference_len);
++  g_autoptr(GBytes) new = g_bytes_new (second, len);
++  g_assert_false (g_bytes_equal (old, new));
++  validity_verify_clear_capture_cache (&self);
++  validity_verify_clear_capture_cache (&self);
++  validity_capture_state_clear (&self.capture);
++}
++
+ static void
+ test_match_decide_verify (void)
+ {
+@@ -3450,6 +3716,348 @@ test_classify_error (void)
    g_error_free (e);
  }
  
@@ -1516,7 +2076,7 @@ index 3bb5d26..f46006e 100644
  /* ================================================================
   * R1f: match_result_clear frees hash
   *
-@@ -4752,6 +5190,232 @@ test_pair_decide (void)
+@@ -4752,6 +5360,232 @@ test_pair_decide (void)
                     ==, VALIDITY_PAIR_REFUSE_UNREADABLE);
  }
  
@@ -1749,7 +2309,7 @@ index 3bb5d26..f46006e 100644
  /* ================================================================
   * T7.14: serialize_partition — known output format
   * ================================================================ */
-@@ -6796,6 +7460,14 @@ main (int argc, char *argv[])
+@@ -6796,6 +7630,14 @@ main (int argc, char *argv[])
                     test_fw_info_parse_present);
    g_test_add_func ("/validity/fwext/fw-info/parse-absent",
                     test_fw_info_parse_absent);
@@ -1764,7 +2324,28 @@ index 3bb5d26..f46006e 100644
    g_test_add_func ("/validity/fwext/fw-info/parse-unknown-status",
                     test_fw_info_parse_unknown_status);
    g_test_add_func ("/validity/fwext/fw-info/parse-truncated",
-@@ -6968,6 +7640,15 @@ main (int argc, char *argv[])
+@@ -6923,6 +7765,20 @@ main (int argc, char *argv[])
+                    test_gallery_match_empty);
+   g_test_add_func ("/validity/verify/user_get_id",
+                    test_user_get_id);
++  g_test_add_func ("/validity/verify/capture_status", test_verify_capture_status);
++  g_test_add_func ("/validity/verify/capture_cache", test_verify_capture_cache);
++  g_test_add_data_func ("/validity/verify/capture_retry_api",
++                        GUINT_TO_POINTER (VALIDITY_VERIFY_CAPTURE_RETRY),
++                        test_verify_capture_failure_api);
++  g_test_add_data_func ("/validity/verify/capture_invalid_api",
++                        GUINT_TO_POINTER (VALIDITY_VERIFY_CAPTURE_INVALID),
++                        test_verify_capture_failure_api);
++  g_test_add_data_func ("/validity/identify/capture_retry_api",
++                        GUINT_TO_POINTER (4 | VALIDITY_VERIFY_CAPTURE_RETRY),
++                        test_verify_capture_failure_api);
++  g_test_add_data_func ("/validity/identify/capture_invalid_api",
++                        GUINT_TO_POINTER (4 | VALIDITY_VERIFY_CAPTURE_INVALID),
++                        test_verify_capture_failure_api);
+   g_test_add_func ("/validity/verify/match_decide_verify",
+                    test_match_decide_verify);
+   g_test_add_func ("/validity/verify/match_decide_identify",
+@@ -6968,6 +7824,15 @@ main (int argc, char *argv[])
    g_test_add_func ("/validity/recovery/classify_error",
                     test_classify_error);
  
@@ -1780,7 +2361,7 @@ index 3bb5d26..f46006e 100644
  
    /* TLS tests */
  
-@@ -7025,6 +7706,18 @@ main (int argc, char *argv[])
+@@ -7025,6 +7890,18 @@ main (int argc, char *argv[])
    g_test_add_func ("/validity/pair/classify-tls-flash/truncated",
                     test_pair_classify_truncated);
    g_test_add_func ("/validity/pair/decide", test_pair_decide);

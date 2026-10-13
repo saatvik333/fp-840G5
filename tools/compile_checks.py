@@ -54,6 +54,25 @@ def main():
     )
     if args.with_vendor_data:
         run([ROOT / "build/verify-native-data"])
+    run(
+        [
+            "cc",
+            "-O2",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            *include,
+            "tools/benchmark_capture.c",
+            "-o",
+            "build/benchmark-capture",
+            "-Wl,--start-group",
+            LIB / "libfprint-drivers.a",
+            LIB / "libfprint-private.a",
+            LIB / "libnbis.a",
+            "-Wl,--end-group",
+            *link,
+        ]
+    )
     run(["cc", "-g", *include, "tools/reader_smoke.c", "-o", "build/reader-smoke", *link])
     run(
         [

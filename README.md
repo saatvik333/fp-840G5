@@ -10,6 +10,12 @@ with HP-specific fixes, reproducible builds and a preservation guard.
 [NOTICE.md](NOTICE.md) credits the upstream work. It uses Ubuntu's normal
 fingerprint stack; python-validity and replacement fprintd daemons are not installed.
 
+The `improve-scan-feedback` branch contains an **unreleased alpha.3 candidate**:
+capture readiness/presence feedback, explicit poor-capture retries and cached
+command preparation. Automated tests pass; these changes still await hardware
+retesting. The installation instructions below select the tested alpha.2 release.
+See the [code and performance review](docs/performance.md).
+
 **Project code is open source; HP firmware remains proprietary.** The Windows host
 driver and firmware-container format were analyzed. The firmware payload remains
 encrypted and was not decrypted/decompiled. Vendor payloads are obtained separately
@@ -89,7 +95,8 @@ cryptographic ownership proof. See [preservation details](docs/install.md#existi
 
 ## Tests and limits
 
-Six native unit suites pass, including **219 Validity cases**, plus four default
+Six native unit suites pass, including **225 Validity cases** on this review branch
+(219 in alpha.2), plus four default
 preservation API checks and six policy/delegation tests. [Hardware results](docs/validation.md)
 record the cancellation failure reproduced and fixed. CI builds/tests source
 without vendor downloads or hardware access.
