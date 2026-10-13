@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import io
 import json
+import re
 import shutil
 import subprocess
 import tarfile
@@ -38,6 +39,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--package", type=Path, required=True)
     args = parser.parse_args()
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", args.package.name):
+        raise SystemExit("Release filenames must use portable characters that GitHub preserves")
     public_status = subprocess.check_output(["git", "-C", str(ROOT), "status", "--porcelain"])
     if public_status:
         raise SystemExit("Commit the reviewed public source before making a release")

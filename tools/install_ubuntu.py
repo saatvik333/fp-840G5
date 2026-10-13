@@ -405,7 +405,7 @@ def rollback():
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    version = (ROOT / "VERSION").read_text().strip().replace("-alpha.", "~alpha")
+    version = (ROOT / "VERSION").read_text().strip()
     parser.add_argument(
         "--package", type=Path, default=ROOT / f"build/fp840g5-native_{version}_amd64.deb"
     )

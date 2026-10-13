@@ -83,7 +83,7 @@ def main():
     run(configure)
     run(["meson", "compile", "-C", build, "-j", args.jobs])
     run(["meson", "test", "-C", build, "--suite", "unit-tests", "--print-errorlogs"])
-    output = ROOT / "build" / f"{PACKAGE}_{VERSION}_{architecture}.deb"
+    output = ROOT / "build" / f"{PACKAGE}_{RELEASE}_{architecture}.deb"
     with tempfile.TemporaryDirectory(prefix="ubuntu-package-", dir=ROOT / "build") as temporary:
         working = Path(temporary)
         destination = working / "root"

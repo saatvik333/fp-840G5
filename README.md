@@ -45,7 +45,7 @@ sudo apt install --no-install-recommends \
 
 git clone https://github.com/saatvik333/fp-840G5.git
 cd fp-840G5
-git checkout v0.1.0-alpha.1
+git checkout v0.1.0-alpha.2
 
 python3 tools/native_build.py --with-vendor-data --accept-vendor-terms
 python3 tools/compile_checks.py --with-vendor-data
@@ -61,7 +61,7 @@ under `/opt/fp-840g5`, selects the library through two standard fprintd drop-ins
 and enables Ubuntu's fingerprint PAM profile. Distribution libraries and existing
 `/var/lib/fprint` metadata are preserved. `--no-pam` leaves PAM selection unchanged.
 
-The [prerelease](https://github.com/saatvik333/fp-840G5/releases/tag/v0.1.0-alpha.1)
+The [prerelease](https://github.com/saatvik333/fp-840G5/releases/tag/v0.1.0-alpha.2)
 also provides a **driver-only .deb**, SHA-256 checksums and complete corresponding
 source. The package contains no vendor firmware/data and does not activate itself.
 See [installation details](docs/install.md) for that route and existing-print behavior.

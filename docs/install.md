@@ -32,8 +32,8 @@ python3 tools/native_build.py --with-vendor-data --accept-vendor-terms
 python3 tools/compile_checks.py --with-vendor-data
 ```
 
-Download `fp840g5-native_0.1.0~alpha1_amd64.deb` and its `.deb.sha256` from the
-[release](https://github.com/saatvik333/fp-840G5/releases/tag/v0.1.0-alpha.1),
+Download `fp840g5-native_0.1.0-alpha.2_amd64.deb` and its `.deb.sha256` from the
+[release](https://github.com/saatvik333/fp-840G5/releases/tag/v0.1.0-alpha.2),
 placing both in `build/`. This route still builds/tests local source while
 preparing data. Then:
 
@@ -41,6 +41,10 @@ preparing data. Then:
 python3 tools/install_ubuntu.py --check
 sudo python3 tools/install_ubuntu.py
 ```
+
+Release filenames use portable characters so GitHub preserves them. The Debian
+package's internal version is `0.1.0~alpha2`; its download filename uses the
+project release version `0.1.0-alpha.2`.
 
 `dpkg -i` alone does not fetch vendor data, select the library or enable PAM.
 The installer checks the package checksum/name/architecture and payload rules,

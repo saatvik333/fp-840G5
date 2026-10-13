@@ -11,4 +11,4 @@ RUN python3 -m unittest discover -s tests -v \
     && python3 tools/native_build.py \
     && python3 tools/compile_checks.py \
     && python3 tools/build_ubuntu_package.py \
-    && python3 tools/audit_package.py build/fp840g5-native_0.1.0~alpha1_amd64.deb
+    && python3 tools/audit_package.py build/fp840g5-native_0.1.0-alpha.2_amd64.deb
