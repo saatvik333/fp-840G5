@@ -30,5 +30,6 @@ The public `.deb` contains only the open-source library/guard and documentation.
 Matching complete patched library source, our guard, build scripts and license
 notices are offered at the same release. Upstream opaque capture/image test
 fixtures are omitted from that source archive with an exclusion manifest; all
-source needed for the released library remains. There are no personal templates,
+source needed for the released library remains. A supplied generator provides
+synthetic input for the upstream image-assembly unit test. There are no personal templates,
 device serials, pairing keys, SSH material or passwords in the public artifacts.
