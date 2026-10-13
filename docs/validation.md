@@ -53,6 +53,13 @@ vendor data and activation scripts are absent. Offline Python tests also cover
 truncated device metadata, service override refusal and service-selection
 recovery when a PAM update fails.
 
+The corresponding-source release archive was separately unpacked and rebuilt
+without network or vendor data in the Ubuntu container. All six native suites,
+four default guard checks and six policy checks passed. The assembly suite used
+the supplied deterministic synthetic image generator; captured upstream images
+and packets remain excluded. Its 20 offline Python tests passed; the five
+vendor-artifact tests were skipped because their private inputs were absent.
+
 ## Untested paths
 
 Cold boot; suspend/resume; fresh-session login/keyring; GUI enrollment/deletion;
